@@ -114,7 +114,10 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
         throw new Error(data.error || "Falha ao conversar com ORION.");
       }
 
-   const brainLabel = data.brain
+   const assistantText =
+  data.reply || "Resposta vazia. Fascinante, mas inútil.";
+
+const brainLabel = data.brain
   ? `\n\n[Sistema: ${data.brain.provider} · ${data.brain.level} · ${data.brain.model}]`
   : "";
 
