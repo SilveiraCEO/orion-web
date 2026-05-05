@@ -114,10 +114,14 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
         throw new Error(data.error || "Falha ao conversar com ORION.");
       }
 
-      const assistantMessage: ChatMessage = {
-        role: "assistant",
-        content: data.reply || "Resposta vazia. Fascinante, mas inútil.",
-      };
+   const brainLabel = data.brain
+  ? `\n\n[Sistema: ${data.brain.provider} · ${data.brain.level} · ${data.brain.model}]`
+  : "";
+
+const assistantMessage: ChatMessage = {
+  role: "assistant",
+  content: assistantText + brainLabel,
+};
 
       setChat((current) => [...current, assistantMessage]);
       setOrbMode("speaking");
