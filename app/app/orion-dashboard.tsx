@@ -39,6 +39,12 @@ type ChatMessage = {
   brain?: BrainInfo;
 };
 
+const WELCOME_MESSAGE: ChatMessage = {
+  role: "assistant",
+  content:
+    "ORION online. Núcleo neural iniciado. Podemos operar por texto, voz manual ou Modo Jarvis.",
+};
+
 const SILENCE_LIMIT_MS = 1400;
 const VOICE_THRESHOLD = 0.045;
 
@@ -47,7 +53,7 @@ export default function OrionDashboard({
   userId,
 }: OrionDashboardProps) {
   const router = useRouter();
-const supabase = useMemo(() => createClient(), []);
+  const supabase = useMemo(() => createClient(), []);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -78,19 +84,18 @@ const supabase = useMemo(() => createClient(), []);
   const [isJarvisMode, setIsJarvisMode] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
-const [memoryText, setMemoryText] = useState("");
-const [isMemoryLoading, setIsMemoryLoading] = useState(true);
-const [isMemorySaving, setIsMemorySaving] = useState(false);
-const [memoryStatus, setMemoryStatus] = useState("");
+  const [memoryText, setMemoryText] = useState("");
+  const [isMemoryLoading, setIsMemoryLoading] = useState(true);
+  const [isMemorySaving, setIsMemorySaving] = useState(false);
+  const [memoryStatus, setMemoryStatus] = useState("");
   const [liveLevel, setLiveLevel] = useState(0);
 
-  const [chat, setChat] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content:
-        "ORION online. Núcleo neural iniciado. Podemos operar por texto, voz manual ou Modo Jarvis.",
-    },
-  ]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [isChatLoading, setIsChatLoading] = useState(true);
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [chatStatus, setChatStatus] = useState("");
+
+  const [chat, setChat] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
 
   const quickCommands = [
     "Crie uma copy premium para anúncio",
@@ -124,24 +129,24 @@ const [memoryStatus, setMemoryStatus] = useState("");
   }, [orbMode, liveLevel]);
 
   useEffect(() => {
-  const savedVoice = localStorage.getItem("orion_voice_enabled");
-  const savedMemory = localStorage.getItem("orion_memory_enabled");
+    const savedVoice = localStorage.getItem("orion_voice_enabled");
+    const savedMemory = localStorage.getItem("orion_memory_enabled");
 
-  if (savedVoice !== null) setVoiceEnabled(savedVoice === "true");
-  if (savedMemory !== null) setMemoryEnabled(savedMemory === "true");
+    if (savedVoice !== null) setVoiceEnabled(savedVoice === "true");
+    if (savedMemory !== null) setMemoryEnabled(savedMemory === "true");
 
-  hardStopAllSpeech();
-}, []);
+    hardStopAllSpeech();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("orion_voice_enabled", String(voiceEnabled));
   }, [voiceEnabled]);
 
   useEffect(() => {
-  if (!voiceEnabled) {
-    hardStopAllSpeech();
-  }
-}, [voiceEnabled]);
+    if (!voiceEnabled) {
+      hardStopAllSpeech();
+    }
+  }, [voiceEnabled]);
 
   useEffect(() => {
     localStorage.setItem("orion_memory_enabled", String(memoryEnabled));
@@ -156,7 +161,7 @@ const [memoryStatus, setMemoryStatus] = useState("");
       top: chatScrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [chat, isSending]);
+  }, [chat, isSending, isChatLoading, chatStatus]);
 
   useEffect(() => {
     return () => {
@@ -168,36 +173,117 @@ const [memoryStatus, setMemoryStatus] = useState("");
   }, []);
 
   useEffect(() => {
-  let mounted = true;
+    let mounted = true;
 
-  async function loadUserMemory() {
-    setIsMemoryLoading(true);
-    setMemoryStatus("");
+    async function loadUserMemory() {
+      setIsMemoryLoading(true);
+      setMemoryStatus("");
 
-    const { data, error } = await supabase
-      .from("user_memories")
-      .select("memory_text")
-      .eq("user_id", userId)
-      .maybeSingle();
+      const { data, error } = await supabase
+        .from("user_memories")
+        .select("memory_text")
+        .eq("user_id", userId)
+        .maybeSingle();
 
-    if (!mounted) return;
+      if (!mounted) return;
 
-    if (error) {
-      setMemoryStatus("Não consegui carregar a memória do Supabase.");
+      if (error) {
+        setMemoryStatus("Não consegui carregar a memória do Supabase.");
+        setIsMemoryLoading(false);
+        return;
+      }
+
+      setMemoryText(data?.memory_text ?? "");
       setIsMemoryLoading(false);
-      return;
     }
 
-    setMemoryText(data?.memory_text ?? "");
-    setIsMemoryLoading(false);
-  }
+    void loadUserMemory();
 
-  void loadUserMemory();
+    return () => {
+      mounted = false;
+    };
+  }, [supabase, userId]);
 
-  return () => {
-    mounted = false;
-  };
-}, [supabase, userId]);
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadLatestChat() {
+      setIsChatLoading(true);
+      setChatStatus("");
+
+      const { data: sessions, error: sessionError } = await supabase
+        .from("chat_sessions")
+        .select("id, title, updated_at")
+        .eq("user_id", userId)
+        .order("updated_at", { ascending: false })
+        .limit(1);
+
+      if (!mounted) return;
+
+      if (sessionError) {
+        setChatStatus("Não consegui carregar suas conversas.");
+        setChat([WELCOME_MESSAGE]);
+        setIsChatLoading(false);
+        return;
+      }
+
+      const latestSession = sessions?.[0];
+
+      if (!latestSession) {
+        const sessionId = await createChatSession("Nova conversa");
+
+        if (!mounted) return;
+
+        setActiveSessionId(sessionId);
+        setChat([WELCOME_MESSAGE]);
+        setIsChatLoading(false);
+        return;
+      }
+
+      setActiveSessionId(latestSession.id);
+
+      const { data: messages, error: messagesError } = await supabase
+        .from("chat_messages")
+        .select("role, content, brain_provider, brain_level, brain_model")
+        .eq("session_id", latestSession.id)
+        .eq("user_id", userId)
+        .order("created_at", { ascending: true });
+
+      if (!mounted) return;
+
+      if (messagesError) {
+        setChatStatus(
+          "Conversa encontrada, mas não consegui carregar as mensagens."
+        );
+        setChat([WELCOME_MESSAGE]);
+        setIsChatLoading(false);
+        return;
+      }
+
+      const mappedMessages: ChatMessage[] =
+        messages?.map((item) => ({
+          role: item.role === "user" ? "user" : "assistant",
+          content: item.content,
+          brain:
+            item.role === "assistant" && item.brain_model
+              ? {
+                  provider: item.brain_provider ?? "IA",
+                  level: item.brain_level ?? "default",
+                  model: item.brain_model ?? "modelo",
+                }
+              : undefined,
+        })) ?? [];
+
+      setChat(mappedMessages.length > 0 ? mappedMessages : [WELCOME_MESSAGE]);
+      setIsChatLoading(false);
+    }
+
+    void loadLatestChat();
+
+    return () => {
+      mounted = false;
+    };
+  }, [supabase, userId]);
 
   async function handleLogout() {
     hardStopAllSpeech();
@@ -205,38 +291,129 @@ const [memoryStatus, setMemoryStatus] = useState("");
     router.push("/login");
   }
 
+  function makeSessionTitle(text: string) {
+    const clean = text.replace(/\s+/g, " ").replace(/[\n\r]/g, " ").trim();
+
+    if (!clean) return "Nova conversa";
+
+    return clean.length > 48 ? clean.slice(0, 48) + "..." : clean;
+  }
+
+  async function createChatSession(firstMessage?: string) {
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .insert({
+        user_id: userId,
+        title: makeSessionTitle(firstMessage || "Nova conversa"),
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      setChatStatus("Não consegui criar uma conversa no Supabase.");
+      return null;
+    }
+
+    setActiveSessionId(data.id);
+    return data.id as string;
+  }
+
+  async function ensureActiveSession(firstMessage?: string) {
+    if (activeSessionId) return activeSessionId;
+    return await createChatSession(firstMessage);
+  }
+
+  async function touchChatSession(sessionId: string, firstMessage?: string) {
+    const payload: {
+      updated_at: string;
+      title?: string;
+    } = {
+      updated_at: new Date().toISOString(),
+    };
+
+    if (firstMessage) {
+      payload.title = makeSessionTitle(firstMessage);
+    }
+
+    await supabase
+      .from("chat_sessions")
+      .update(payload)
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+  }
+
+  async function saveChatMessageToSupabase(
+    sessionId: string,
+    chatMessage: ChatMessage
+  ) {
+    const { error } = await supabase.from("chat_messages").insert({
+      session_id: sessionId,
+      user_id: userId,
+      role: chatMessage.role,
+      content: chatMessage.content,
+      brain_provider: chatMessage.brain?.provider ?? null,
+      brain_level: chatMessage.brain?.level ?? null,
+      brain_model: chatMessage.brain?.model ?? null,
+    });
+
+    if (error) {
+      setChatStatus("Mensagem exibida na tela, mas não foi salva no histórico.");
+    }
+  }
+
+  async function createNewConversation() {
+    setIsCreatingSession(true);
+    setChatStatus("");
+    hardStopAllSpeech();
+
+    const sessionId = await createChatSession("Nova conversa");
+
+    setIsCreatingSession(false);
+
+    if (!sessionId) return;
+
+    setMessage("");
+    setAttachedFiles([]);
+    setChat([WELCOME_MESSAGE]);
+    setChatStatus("Nova conversa iniciada.");
+
+    setTimeout(() => {
+      setChatStatus("");
+    }, 1800);
+  }
+
   function getMemoryPrompt() {
     if (!memoryEnabled || !memoryText.trim()) return "";
     return `Contexto permanente do usuário:\n${memoryText.trim()}\n\n`;
   }
-  
+
   async function saveMemoryToSupabase(nextMemory = memoryText) {
-  setIsMemorySaving(true);
-  setMemoryStatus("");
-
-  const { error } = await supabase.from("user_memories").upsert(
-    {
-      user_id: userId,
-      memory_text: nextMemory.trim(),
-    },
-    {
-      onConflict: "user_id",
-    }
-  );
-
-  setIsMemorySaving(false);
-
-  if (error) {
-    setMemoryStatus("Erro ao salvar memória: " + error.message);
-    return;
-  }
-
-  setMemoryStatus("Memória salva no Supabase.");
-
-  setTimeout(() => {
+    setIsMemorySaving(true);
     setMemoryStatus("");
-  }, 2200);
-}
+
+    const { error } = await supabase.from("user_memories").upsert(
+      {
+        user_id: userId,
+        memory_text: nextMemory.trim(),
+      },
+      {
+        onConflict: "user_id",
+      }
+    );
+
+    setIsMemorySaving(false);
+
+    if (error) {
+      setMemoryStatus("Erro ao salvar memória: " + error.message);
+      return;
+    }
+
+    setMemoryStatus("Memória salva no Supabase.");
+
+    setTimeout(() => {
+      setMemoryStatus("");
+    }, 2200);
+  }
 
   function stopListeningLoop() {
     if (silenceFrameRef.current) {
@@ -476,7 +653,9 @@ const [memoryStatus, setMemoryStatus] = useState("");
   async function sendToOrion(userVisibleText: string, internalText?: string) {
     const cleanText = userVisibleText.trim();
 
-    if ((!cleanText && attachedFiles.length === 0) || isSending) return;
+    if ((!cleanText && attachedFiles.length === 0) || isSending || isChatLoading) {
+      return;
+    }
 
     const historySnapshot = [...chat];
 
@@ -496,11 +675,25 @@ const [memoryStatus, setMemoryStatus] = useState("");
       content: visibleUserContent + filesNote,
     };
 
+    const isFirstRealUserMessage =
+      historySnapshot.filter((item) => item.role === "user").length === 0;
+
+    const sessionId = await ensureActiveSession(visibleUserContent);
+
     setChat((current) => [...current, userMessage]);
     setMessage("");
     setAttachedFiles([]);
     setIsSending(true);
     setOrbMode("processing");
+    setChatStatus("");
+
+    if (sessionId) {
+      await saveChatMessageToSupabase(sessionId, userMessage);
+      await touchChatSession(
+        sessionId,
+        isFirstRealUserMessage ? visibleUserContent : undefined
+      );
+    }
 
     try {
       const response = await fetch("/api/chat", {
@@ -532,6 +725,11 @@ const [memoryStatus, setMemoryStatus] = useState("");
       setChat((current) => [...current, assistantMessage]);
       setIsSending(false);
 
+      if (sessionId) {
+        await saveChatMessageToSupabase(sessionId, assistantMessage);
+        await touchChatSession(sessionId);
+      }
+
       if (jarvisModeRef.current) {
         shouldResumeJarvisAfterSpeechRef.current = true;
       }
@@ -552,20 +750,23 @@ const [memoryStatus, setMemoryStatus] = useState("");
         }, 300);
       }
     } catch (error) {
-      setChat((current) => [
-        ...current,
-        {
-          role: "assistant",
-          content:
-            "Pequeno deslize meu. " +
-            (error instanceof Error
-              ? error.message
-              : "Não consegui processar essa solicitação agora."),
-        },
-      ]);
+      const errorMessage: ChatMessage = {
+        role: "assistant",
+        content:
+          "Pequeno deslize meu. " +
+          (error instanceof Error
+            ? error.message
+            : "Não consegui processar essa solicitação agora."),
+      };
 
+      setChat((current) => [...current, errorMessage]);
       setIsSending(false);
       setOrbMode("idle");
+
+      if (sessionId) {
+        await saveChatMessageToSupabase(sessionId, errorMessage);
+        await touchChatSession(sessionId);
+      }
     }
   }
 
@@ -844,27 +1045,27 @@ const [memoryStatus, setMemoryStatus] = useState("");
   }
 
   function toggleVoiceEnabled() {
-  const isTurningOff = voiceEnabled;
+    const isTurningOff = voiceEnabled;
 
-  if (isTurningOff) {
-    shouldResumeJarvisAfterSpeechRef.current = false;
-    hardStopAllSpeech();
+    if (isTurningOff) {
+      shouldResumeJarvisAfterSpeechRef.current = false;
+      hardStopAllSpeech();
 
-    if (jarvisModeRef.current && !isRecording && !processingVoiceRef.current) {
-      setTimeout(() => {
-        if (
-          jarvisModeRef.current &&
-          !processingVoiceRef.current &&
-          !isSpeakingRef.current
-        ) {
-          startRecording(true);
-        }
-      }, 350);
+      if (jarvisModeRef.current && !isRecording && !processingVoiceRef.current) {
+        setTimeout(() => {
+          if (
+            jarvisModeRef.current &&
+            !processingVoiceRef.current &&
+            !isSpeakingRef.current
+          ) {
+            startRecording(true);
+          }
+        }, 350);
+      }
     }
-  }
 
-  setVoiceEnabled((current) => !current);
-}
+    setVoiceEnabled((current) => !current);
+  }
 
   function toggleJarvisMode() {
     if (isJarvisMode) {
@@ -935,13 +1136,14 @@ const [memoryStatus, setMemoryStatus] = useState("");
   }
 
   const orbSpeakingLevel =
-  orbMode === "speaking"
-    ? Math.max(0.18, Math.min(1, liveLevel * 2.8))
-    : orbMode === "listening"
-    ? Math.max(0.14, Math.min(1, liveLevel * 2.2))
-    : orbMode === "processing"
-    ? 0.18
-    : 0.045;
+    orbMode === "speaking"
+      ? Math.max(0.18, Math.min(1, liveLevel * 2.8))
+      : orbMode === "listening"
+      ? Math.max(0.14, Math.min(1, liveLevel * 2.2))
+      : orbMode === "processing"
+      ? 0.18
+      : 0.045;
+
   return (
     <main className="h-screen overflow-hidden bg-[#050816] text-white">
       <div className="pointer-events-none fixed inset-0">
@@ -1135,11 +1337,20 @@ const [memoryStatus, setMemoryStatus] = useState("");
                   </div>
 
                   <div className="flex items-center gap-2">
-                   <ToggleButton
-  label="Voz"
-  active={voiceEnabled}
-  onClick={toggleVoiceEnabled}
-/>
+                    <button
+                      onClick={() => void createNewConversation()}
+                      disabled={isCreatingSession || isSending}
+                      className="rounded-full border border-cyan-300/15 bg-cyan-300/[0.06] px-3 py-1.5 text-[11px] font-bold text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/35 hover:bg-cyan-300/[0.1] disabled:opacity-50"
+                    >
+                      {isCreatingSession ? "Criando..." : "Nova conversa"}
+                    </button>
+
+                    <ToggleButton
+                      label="Voz"
+                      active={voiceEnabled}
+                      onClick={toggleVoiceEnabled}
+                    />
+
                     <ToggleButton
                       label="Memória"
                       active={memoryEnabled}
@@ -1153,6 +1364,18 @@ const [memoryStatus, setMemoryStatus] = useState("");
                   className="orion-scroll flex-1 min-h-0 overflow-y-auto p-4"
                 >
                   <div className="space-y-3">
+                    {isChatLoading && (
+                      <div className="rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.05] p-4 text-sm text-cyan-100">
+                        Carregando histórico da conversa...
+                      </div>
+                    )}
+
+                    {chatStatus && (
+                      <div className="rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-4 text-sm text-slate-300">
+                        {chatStatus}
+                      </div>
+                    )}
+
                     {chat.map((item, index) => (
                       <ChatBubble key={index} message={item} />
                     ))}
@@ -1238,7 +1461,7 @@ const [memoryStatus, setMemoryStatus] = useState("");
 
                       <input
                         value={message}
-                        disabled={isSending}
+                        disabled={isSending || isChatLoading}
                         onChange={(event) => setMessage(event.target.value)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter") {
@@ -1252,7 +1475,7 @@ const [memoryStatus, setMemoryStatus] = useState("");
 
                       <button
                         onClick={() => void handleSend()}
-                        disabled={isSending}
+                        disabled={isSending || isChatLoading}
                         className="rounded-xl bg-cyan-300 px-5 py-3 text-sm font-black text-black transition-all duration-300 hover:-translate-y-0.5 hover:bg-cyan-200 hover:shadow-[0_0_24px_rgba(97,239,255,0.22)] disabled:opacity-50"
                       >
                         {isSending ? "..." : "Enviar"}
@@ -1272,52 +1495,50 @@ const [memoryStatus, setMemoryStatus] = useState("");
 
           <aside className="hidden min-h-0 flex-col gap-4 overflow-hidden xl:flex">
             <Panel title="MEMÓRIA">
-  <p className="mb-3 text-xs text-slate-500">
-    Informações que o ORION deve considerar nas respostas. Agora isso fica salvo
-    no Supabase por usuário.
-  </p>
+              <p className="mb-3 text-xs text-slate-500">
+                Informações que o ORION deve considerar nas respostas. Agora isso
+                fica salvo no Supabase por usuário.
+              </p>
 
-  {isMemoryLoading && (
-    <div className="mb-3 rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-3 text-xs text-cyan-100">
-      Carregando memória...
-    </div>
-  )}
+              {isMemoryLoading && (
+                <div className="mb-3 rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-3 text-xs text-cyan-100">
+                  Carregando memória...
+                </div>
+              )}
 
-  <textarea
-    value={memoryText}
-    disabled={isMemoryLoading}
-    onChange={(event) => setMemoryText(event.target.value)}
-    className="orion-scroll h-32 w-full resize-none rounded-2xl border border-cyan-300/10 bg-black/30 p-3 text-sm text-slate-200 outline-none transition-all duration-300 placeholder:text-slate-600 focus:border-cyan-300/40 focus:shadow-[0_0_24px_rgba(97,239,255,0.08)] disabled:opacity-50"
-    placeholder="Ex: trabalho com e-commerce, vendo produtos físicos, foco em Meta Ads, quero respostas diretas..."
-  />
+              <textarea
+                value={memoryText}
+                disabled={isMemoryLoading}
+                onChange={(event) => setMemoryText(event.target.value)}
+                className="orion-scroll h-32 w-full resize-none rounded-2xl border border-cyan-300/10 bg-black/30 p-3 text-sm text-slate-200 outline-none transition-all duration-300 placeholder:text-slate-600 focus:border-cyan-300/40 focus:shadow-[0_0_24px_rgba(97,239,255,0.08)] disabled:opacity-50"
+                placeholder="Ex: trabalho com e-commerce, vendo produtos físicos, foco em Meta Ads, quero respostas diretas..."
+              />
 
-  <div className="mt-3 grid grid-cols-2 gap-2">
-    <button
-      onClick={() => void saveMemoryToSupabase()}
-      disabled={isMemoryLoading || isMemorySaving}
-      className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.08] px-3 py-2 text-sm font-bold text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/40 hover:bg-cyan-300/[0.12] disabled:opacity-50"
-    >
-      {isMemorySaving ? "Salvando..." : "Salvar memória"}
-    </button>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => void saveMemoryToSupabase()}
+                  disabled={isMemoryLoading || isMemorySaving}
+                  className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.08] px-3 py-2 text-sm font-bold text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/40 hover:bg-cyan-300/[0.12] disabled:opacity-50"
+                >
+                  {isMemorySaving ? "Salvando..." : "Salvar memória"}
+                </button>
 
-    <button
-      onClick={() => {
-        setMemoryText("");
-        void saveMemoryToSupabase("");
-      }}
-      disabled={isMemoryLoading || isMemorySaving}
-      className="rounded-xl border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-sm font-bold text-red-200 transition-all duration-300 hover:-translate-y-0.5 hover:bg-red-400/[0.1] disabled:opacity-50"
-    >
-      Limpar
-    </button>
-  </div>
+                <button
+                  onClick={() => {
+                    setMemoryText("");
+                    void saveMemoryToSupabase("");
+                  }}
+                  disabled={isMemoryLoading || isMemorySaving}
+                  className="rounded-xl border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-sm font-bold text-red-200 transition-all duration-300 hover:-translate-y-0.5 hover:bg-red-400/[0.1] disabled:opacity-50"
+                >
+                  Limpar
+                </button>
+              </div>
 
-  {memoryStatus && (
-    <p className="mt-3 text-xs text-slate-400">
-      {memoryStatus}
-    </p>
-  )}
-</Panel>
+              {memoryStatus && (
+                <p className="mt-3 text-xs text-slate-400">{memoryStatus}</p>
+              )}
+            </Panel>
 
             <Panel title="INTEGRAÇÕES">
               <IntegrationItem
@@ -1349,7 +1570,9 @@ const [memoryStatus, setMemoryStatus] = useState("");
               <RoadmapItem done text="Voz ElevenLabs" />
               <RoadmapItem done text="Modo Jarvis beta" />
               <RoadmapItem done text="Geoide 3D" />
-              <RoadmapItem text="Memória persistente" />
+              <RoadmapItem done text="Memória persistente" />
+              <RoadmapItem done text="Histórico de conversas" />
+              <RoadmapItem text="Lista lateral de chats" />
             </Panel>
           </aside>
         </section>
