@@ -777,7 +777,9 @@ export default function OrionDashboard({
     }
   }
 
-  async function sendToOrion(userVisibleText: string, internalText?: string) {
+  const uploadedFiles = attachedFiles.filter(
+  (file) => file.status === "uploaded"
+);
     const cleanText = userVisibleText.trim();
 
     if (isUploadingFiles) {
@@ -795,11 +797,61 @@ if (
 
     const historySnapshot = [...chat];
 
-    const uploadedFiles = attachedFiles.filter(
-  (file) => file.status === "uploaded"
+    const imageFiles = uploadedFiles.filter((file) =>
+  file.type.startsWith("image/")
 );
 
+let imageAnalysisText = "";
+
+for (const file of imageFiles) {
+  if (!file.fileId) continue;
+
+  try {
+    const res = await fetch("/api/read-image", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        fileId: file.fileId,
+        prompt:
+          "Analise esta imagem com foco em e-commerce, marketing, anúncios, clareza visual, qualidade criativa e conversão.",
+      }),
+    });
+
+    const data = await res.json();
+
+    if (data.text) {
+      imageAnalysisText += `\n\nAnálise visual da imagem ${file.name}:\n${data.text}`;
+    }
+  } catch {
+    imageAnalysisText += `\n\nNão consegui analisar visualmente a imagem ${file.name}.`;
+  }
+}
+
 const failedFiles = attachedFiles.filter((file) => file.status === "error");
+
+let extractedFilesText = "";
+
+for (const file of uploadedFiles) {
+  try {
+    const res = await fetch("/api/read-file", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ fileId: file.fileId }),
+    });
+
+    const data = await res.json();
+
+    if (data.text) {
+      extractedFilesText += `\n\nConteúdo do arquivo ${file.name}:\n${data.text}`;
+    }
+  } catch {
+    // ignora erro
+  }
+}
 
   const filesNote =
   uploadedFiles.length > 0
@@ -821,8 +873,12 @@ const failedFiles = attachedFiles.filter((file) => file.status === "error");
 }
 
     const visibleUserContent = cleanText || "Analise os arquivos anexados.";
-    const messageForAI =
-      getMemoryPrompt() + (internalText || visibleUserContent) + filesNote;
+  const messageForAI =
+  getMemoryPrompt() +
+  (internalText || visibleUserContent) +
+  filesNote +
+  extractedFilesText +
+  imageAnalysisText;
 
     const userMessage: ChatMessage = {
       role: "user",
