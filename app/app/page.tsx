@@ -13,5 +13,10 @@ export default async function AppPage() {
     redirect("/login");
   }
 
-  return <OrionDashboard userEmail={user.email ?? "Usuário ORION"} />;
+  return (
+    <OrionDashboard
+      userEmail={user.email ?? "Usuário ORION"}
+      userId={user.id}
+    />
+  );
 }

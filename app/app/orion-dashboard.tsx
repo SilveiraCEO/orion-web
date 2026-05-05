@@ -14,6 +14,7 @@ import Orb3D from "@/components/Orb3D";
 
 type OrionDashboardProps = {
   userEmail: string;
+  userId: string;
 };
 
 type OrbMode = "idle" | "processing" | "speaking" | "listening";
@@ -41,9 +42,12 @@ type ChatMessage = {
 const SILENCE_LIMIT_MS = 1400;
 const VOICE_THRESHOLD = 0.045;
 
-export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
+export default function OrionDashboard({
+  userEmail,
+  userId,
+}: OrionDashboardProps) {
   const router = useRouter();
-  const supabase = createClient();
+const supabase = useMemo(() => createClient(), []);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -74,7 +78,10 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const [isJarvisMode, setIsJarvisMode] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
-  const [memoryText, setMemoryText] = useState("");
+const [memoryText, setMemoryText] = useState("");
+const [isMemoryLoading, setIsMemoryLoading] = useState(true);
+const [isMemorySaving, setIsMemorySaving] = useState(false);
+const [memoryStatus, setMemoryStatus] = useState("");
   const [liveLevel, setLiveLevel] = useState(0);
 
   const [chat, setChat] = useState<ChatMessage[]>([
@@ -117,16 +124,14 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   }, [orbMode, liveLevel]);
 
   useEffect(() => {
-    const savedVoice = localStorage.getItem("orion_voice_enabled");
-    const savedMemory = localStorage.getItem("orion_memory_enabled");
-    const savedMemoryText = localStorage.getItem("orion_memory_text");
+  const savedVoice = localStorage.getItem("orion_voice_enabled");
+  const savedMemory = localStorage.getItem("orion_memory_enabled");
 
-    if (savedVoice !== null) setVoiceEnabled(savedVoice === "true");
-    if (savedMemory !== null) setMemoryEnabled(savedMemory === "true");
-    if (savedMemoryText) setMemoryText(savedMemoryText);
+  if (savedVoice !== null) setVoiceEnabled(savedVoice === "true");
+  if (savedMemory !== null) setMemoryEnabled(savedMemory === "true");
 
-    hardStopAllSpeech();
-  }, []);
+  hardStopAllSpeech();
+}, []);
 
   useEffect(() => {
     localStorage.setItem("orion_voice_enabled", String(voiceEnabled));
@@ -135,10 +140,6 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   useEffect(() => {
     localStorage.setItem("orion_memory_enabled", String(memoryEnabled));
   }, [memoryEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem("orion_memory_text", memoryText);
-  }, [memoryText]);
 
   useEffect(() => {
     jarvisModeRef.current = isJarvisMode;
@@ -160,6 +161,38 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     };
   }, []);
 
+  useEffect(() => {
+  let mounted = true;
+
+  async function loadUserMemory() {
+    setIsMemoryLoading(true);
+    setMemoryStatus("");
+
+    const { data, error } = await supabase
+      .from("user_memories")
+      .select("memory_text")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (!mounted) return;
+
+    if (error) {
+      setMemoryStatus("Não consegui carregar a memória do Supabase.");
+      setIsMemoryLoading(false);
+      return;
+    }
+
+    setMemoryText(data?.memory_text ?? "");
+    setIsMemoryLoading(false);
+  }
+
+  void loadUserMemory();
+
+  return () => {
+    mounted = false;
+  };
+}, [supabase, userId]);
+
   async function handleLogout() {
     hardStopAllSpeech();
     await supabase.auth.signOut();
@@ -170,6 +203,34 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     if (!memoryEnabled || !memoryText.trim()) return "";
     return `Contexto permanente do usuário:\n${memoryText.trim()}\n\n`;
   }
+  
+  async function saveMemoryToSupabase(nextMemory = memoryText) {
+  setIsMemorySaving(true);
+  setMemoryStatus("");
+
+  const { error } = await supabase.from("user_memories").upsert(
+    {
+      user_id: userId,
+      memory_text: nextMemory.trim(),
+    },
+    {
+      onConflict: "user_id",
+    }
+  );
+
+  setIsMemorySaving(false);
+
+  if (error) {
+    setMemoryStatus("Erro ao salvar memória: " + error.message);
+    return;
+  }
+
+  setMemoryStatus("Memória salva no Supabase.");
+
+  setTimeout(() => {
+    setMemoryStatus("");
+  }, 2200);
+}
 
   function stopListeningLoop() {
     if (silenceFrameRef.current) {
@@ -1182,24 +1243,52 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
 
           <aside className="hidden min-h-0 flex-col gap-4 overflow-hidden xl:flex">
             <Panel title="MEMÓRIA">
-              <p className="mb-3 text-xs text-slate-500">
-                Informações que o ORION deve considerar nas respostas.
-              </p>
+  <p className="mb-3 text-xs text-slate-500">
+    Informações que o ORION deve considerar nas respostas. Agora isso fica salvo
+    no Supabase por usuário.
+  </p>
 
-              <textarea
-                value={memoryText}
-                onChange={(event) => setMemoryText(event.target.value)}
-                className="orion-scroll h-32 w-full resize-none rounded-2xl border border-cyan-300/10 bg-black/30 p-3 text-sm text-slate-200 outline-none transition-all duration-300 placeholder:text-slate-600 focus:border-cyan-300/40 focus:shadow-[0_0_24px_rgba(97,239,255,0.08)]"
-                placeholder="Ex: trabalho com e-commerce, vendo produtos físicos, foco em Meta Ads, quero respostas diretas..."
-              />
+  {isMemoryLoading && (
+    <div className="mb-3 rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-3 text-xs text-cyan-100">
+      Carregando memória...
+    </div>
+  )}
 
-              <button
-                onClick={() => setMemoryText("")}
-                className="mt-3 w-full rounded-xl border border-cyan-300/10 bg-cyan-300/[0.04] px-3 py-2 text-sm font-bold text-slate-300 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/30 hover:text-cyan-100"
-              >
-                Limpar memória local
-              </button>
-            </Panel>
+  <textarea
+    value={memoryText}
+    disabled={isMemoryLoading}
+    onChange={(event) => setMemoryText(event.target.value)}
+    className="orion-scroll h-32 w-full resize-none rounded-2xl border border-cyan-300/10 bg-black/30 p-3 text-sm text-slate-200 outline-none transition-all duration-300 placeholder:text-slate-600 focus:border-cyan-300/40 focus:shadow-[0_0_24px_rgba(97,239,255,0.08)] disabled:opacity-50"
+    placeholder="Ex: trabalho com e-commerce, vendo produtos físicos, foco em Meta Ads, quero respostas diretas..."
+  />
+
+  <div className="mt-3 grid grid-cols-2 gap-2">
+    <button
+      onClick={() => void saveMemoryToSupabase()}
+      disabled={isMemoryLoading || isMemorySaving}
+      className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.08] px-3 py-2 text-sm font-bold text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/40 hover:bg-cyan-300/[0.12] disabled:opacity-50"
+    >
+      {isMemorySaving ? "Salvando..." : "Salvar memória"}
+    </button>
+
+    <button
+      onClick={() => {
+        setMemoryText("");
+        void saveMemoryToSupabase("");
+      }}
+      disabled={isMemoryLoading || isMemorySaving}
+      className="rounded-xl border border-red-400/20 bg-red-400/[0.06] px-3 py-2 text-sm font-bold text-red-200 transition-all duration-300 hover:-translate-y-0.5 hover:bg-red-400/[0.1] disabled:opacity-50"
+    >
+      Limpar
+    </button>
+  </div>
+
+  {memoryStatus && (
+    <p className="mt-3 text-xs text-slate-400">
+      {memoryStatus}
+    </p>
+  )}
+</Panel>
 
             <Panel title="INTEGRAÇÕES">
               <IntegrationItem
