@@ -17,6 +17,11 @@ type AttachedFile = {
   type: string;
 };
 
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
 export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const router = useRouter();
   const supabase = createClient();
@@ -25,6 +30,14 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const [message, setMessage] = useState("");
   const [orbMode, setOrbMode] = useState<OrbMode>("idle");
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const [chat, setChat] = useState<ChatMessage[]>([
+    {
+      role: "assistant",
+      content:
+        "ORION online. Diga o que precisa otimizar na sua operação, senhor. Prometo não julgar suas métricas... ainda.",
+    },
+  ]);
+  const [isSending, setIsSending] = useState(false);
 
   const quickCommands = [
     "Crie uma copy para anúncio de produto",
@@ -56,32 +69,88 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     router.push("/login");
   }
 
-  function handleSend() {
-    if (!message.trim() && attachedFiles.length === 0) return;
+  async function handleSend() {
+    const cleanMessage = message.trim();
 
-    const filesText =
+    if ((!cleanMessage && attachedFiles.length === 0) || isSending) return;
+
+    const fileNote =
       attachedFiles.length > 0
-        ? "\n\nArquivos anexados:\n" + attachedFiles.map((file) => `- ${file.name}`).join("\n")
+        ? "\n\nArquivos anexados pelo usuário: " +
+          attachedFiles.map((file) => `${file.name} (${file.type})`).join(", ") +
+          "\nObservação: nesta etapa, os arquivos ainda não são enviados para análise real. Apenas considere os nomes informados."
         : "";
 
-    alert(
-      "Chat real será conectado no próximo passo.\n\nMensagem: " +
-        (message || "Sem texto") +
-        filesText
-    );
+    const userContent = cleanMessage || "Analise os arquivos anexados.";
 
+    const userMessage: ChatMessage = {
+      role: "user",
+      content: userContent + fileNote,
+    };
+
+    const nextChat = [...chat, userMessage];
+
+    setChat(nextChat);
     setMessage("");
     setAttachedFiles([]);
+    setIsSending(true);
     setOrbMode("processing");
-    setTimeout(() => setOrbMode("idle"), 1400);
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: userMessage.content,
+          history: chat.slice(-8),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Falha ao conversar com ORION.");
+      }
+
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        content: data.reply || "Resposta vazia. Fascinante, mas inútil.",
+      };
+
+      setChat((current) => [...current, assistantMessage]);
+      setOrbMode("speaking");
+      setTimeout(() => setOrbMode("idle"), 1600);
+    } catch (error) {
+      setChat((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content:
+            "Pequeno deslize meu. " +
+            (error instanceof Error
+              ? error.message
+              : "Não consegui processar essa solicitação agora."),
+        },
+      ]);
+      setOrbMode("idle");
+    } finally {
+      setIsSending(false);
+    }
   }
 
   function handleVoiceClick() {
     setOrbMode("listening");
 
-    alert(
-      "Microfone será conectado na próxima etapa.\n\nFluxo planejado:\nMicrofone → transcrição → IA → ElevenLabs → orb reagindo ao áudio."
-    );
+    setChat((current) => [
+      ...current,
+      {
+        role: "assistant",
+        content:
+          "Microfone ainda não está conectado nesta etapa. Próximo módulo: voz real com transcrição e ElevenLabs.",
+      },
+    ]);
 
     setTimeout(() => setOrbMode("idle"), 1800);
   }
@@ -168,6 +237,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
             <Panel title="SISTEMA">
               <StatusRow label="Motor de IA" value="Online" status="ok" />
               <StatusRow label="Supabase" value="Conectado" status="ok" />
+              <StatusRow label="Chat" value="Ativo" status="ok" />
               <StatusRow label="ElevenLabs" value="Próxima etapa" status="warn" />
               <StatusRow label="Arquivos" value="Preparado" status="ok" />
               <StatusRow label="Dropi" value="Aguardando" status="off" />
@@ -175,7 +245,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
 
             <Panel title="USO">
               <div className="space-y-4">
-                <UsageBar label="Mensagens" value="12 / 100" percent={12} />
+                <UsageBar label="Mensagens" value={`${chat.length} / 100`} percent={Math.min(chat.length, 100)} />
                 <UsageBar label="Voz" value="0 / 30 min" percent={0} />
                 <UsageBar label="Arquivos" value={`${attachedFiles.length} / 8`} percent={(attachedFiles.length / 8) * 100} />
                 <UsageBar label="Integrações" value="0 / 3" percent={0} />
@@ -237,31 +307,38 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
               </div>
             </div>
 
-            <div className="flex-1 px-5 md:px-8 py-8 flex flex-col items-center justify-center">
-              <OrbCore mode={orbMode} waveformHeights={waveformHeights} />
+            <div className="grid flex-1 grid-cols-1 2xl:grid-cols-[minmax(360px,0.9fr)_minmax(420px,1.1fr)] gap-4 px-5 md:px-8 py-6 overflow-hidden">
+              <div className="flex flex-col items-center justify-center">
+                <OrbCore mode={orbMode} waveformHeights={waveformHeights} />
 
-              <h2 className="mt-8 text-3xl md:text-[2.55rem] font-black tracking-[0.34em] text-cyan-100 text-center uppercase">
-                ORION
-              </h2>
+                <h2 className="mt-6 text-3xl md:text-[2.35rem] font-black tracking-[0.34em] text-cyan-100 text-center uppercase">
+                  ORION
+                </h2>
 
-              <p className="mt-3 max-w-2xl text-center text-slate-400 text-sm md:text-base">
-                Crie anúncios, analise margens, organize sua operação e tome decisões
-                com mais inteligência.
-              </p>
+                <p className="mt-3 max-w-xl text-center text-slate-400 text-sm md:text-base">
+                  Crie anúncios, analise margens, organize sua operação e tome decisões
+                  com mais inteligência.
+                </p>
+              </div>
 
-              <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-3 w-full max-w-4xl">
-                <FeatureCard
-                  title="Criativos"
-                  description="Ideias, copies e estruturas para campanhas."
-                />
-                <FeatureCard
-                  title="Operação"
-                  description="Produtos, pedidos e visão prática do negócio."
-                />
-                <FeatureCard
-                  title="Estratégia"
-                  description="Análise, margem, oferta e crescimento."
-                />
+              <div className="min-h-[420px] rounded-3xl border border-cyan-400/10 bg-[#020611]/70 overflow-hidden flex flex-col">
+                <div className="border-b border-cyan-400/10 px-4 py-3">
+                  <p className="text-[11px] uppercase tracking-[0.24em] text-cyan-200">
+                    Conversa neural
+                  </p>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                  {chat.map((item, index) => (
+                    <ChatBubble key={index} message={item} />
+                  ))}
+
+                  {isSending && (
+                    <div className="rounded-2xl border border-cyan-400/10 bg-cyan-400/[0.04] p-4 text-sm text-cyan-100">
+                      ORION está analisando...
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -322,19 +399,21 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
 
                 <input
                   value={message}
+                  disabled={isSending}
                   onChange={(e) => setMessage(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") handleSend();
                   }}
-                  className="flex-1 bg-transparent px-4 py-3 outline-none text-white placeholder:text-slate-600"
+                  className="flex-1 bg-transparent px-4 py-3 outline-none text-white placeholder:text-slate-600 disabled:opacity-50"
                   placeholder="Digite um comando para o ORION..."
                 />
 
                 <button
                   onClick={handleSend}
-                  className="rounded-xl bg-cyan-300 px-5 py-3 text-sm font-bold text-black hover:bg-cyan-200 transition"
+                  disabled={isSending}
+                  className="rounded-xl bg-cyan-300 px-5 py-3 text-sm font-bold text-black hover:bg-cyan-200 transition disabled:opacity-50"
                 >
-                  Enviar
+                  {isSending ? "..." : "Enviar"}
                 </button>
               </div>
             </div>
@@ -376,7 +455,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
               <RoadmapItem done text="Autenticação web" />
               <RoadmapItem done text="Painel premium" />
               <RoadmapItem done text="Upload visual de arquivos" />
-              <RoadmapItem text="Chat real com IA" />
+              <RoadmapItem done text="Chat real com IA" />
               <RoadmapItem text="Voz ElevenLabs" />
               <RoadmapItem text="Ondas sonoras reativas" />
               <RoadmapItem text="Integração Dropi" />
@@ -385,6 +464,27 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
         </section>
       </div>
     </main>
+  );
+}
+
+function ChatBubble({ message }: { message: ChatMessage }) {
+  const isUser = message.role === "user";
+
+  return (
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+      <div
+        className={`max-w-[88%] rounded-2xl border px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
+          isUser
+            ? "border-orange-400/20 bg-orange-400/[0.06] text-orange-50"
+            : "border-cyan-400/15 bg-cyan-400/[0.05] text-slate-200"
+        }`}
+      >
+        <p className="mb-1 text-[10px] uppercase tracking-[0.22em] opacity-60">
+          {isUser ? "Usuário" : "ORION"}
+        </p>
+        {message.content}
+      </div>
+    </div>
   );
 }
 
@@ -408,7 +508,7 @@ function OrbCore({
   waveformHeights: number[];
 }) {
   return (
-    <div className="relative flex items-center justify-center h-[23rem] w-[23rem] md:h-[27rem] md:w-[27rem]">
+    <div className="relative flex items-center justify-center h-[21rem] w-[21rem] md:h-[24rem] md:w-[24rem]">
       <div className="absolute inset-0 rounded-full border border-cyan-300/8" />
       <div className="absolute inset-5 rounded-full border border-cyan-300/10" />
       <div className="absolute inset-10 rounded-full border border-cyan-400/18" />
@@ -427,7 +527,7 @@ function OrbCore({
             key={index}
             className="absolute left-1/2 top-1/2 origin-center"
             style={{
-              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-170px)`,
+              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-150px)`,
             }}
           >
             <div
@@ -445,13 +545,6 @@ function OrbCore({
           </div>
         );
       })}
-
-      <div className="absolute h-full w-full animate-pulse">
-        <div className="absolute left-1/2 top-6 h-2 w-2 -translate-x-1/2 rounded-full bg-cyan-300 shadow-[0_0_18px_rgba(34,211,238,1)]" />
-        <div className="absolute right-16 top-1/4 h-2 w-2 rounded-full bg-orange-300 shadow-[0_0_18px_rgba(251,146,60,1)]" />
-        <div className="absolute bottom-12 left-1/4 h-2 w-2 rounded-full bg-cyan-200 shadow-[0_0_18px_rgba(103,232,249,1)]" />
-        <div className="absolute left-14 top-[35%] h-2 w-2 rounded-full bg-cyan-300 shadow-[0_0_18px_rgba(34,211,238,1)]" />
-      </div>
 
       <div className="relative flex h-44 w-44 md:h-52 md:w-52 items-center justify-center rounded-full border border-cyan-200/30 bg-[#020611] shadow-[inset_0_0_70px_rgba(34,211,238,0.14),0_0_90px_rgba(34,211,238,0.16)]">
         <div className="absolute inset-4 rounded-full border border-cyan-300/12" />
@@ -641,21 +734,6 @@ function UsageBar({
           style={{ width: `${percent}%` }}
         />
       </div>
-    </div>
-  );
-}
-
-function FeatureCard({
-  title,
-  description,
-}: {
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="rounded-2xl border border-cyan-400/15 bg-white/[0.02] p-4 hover:bg-cyan-400/[0.04] transition">
-      <p className="text-base font-bold text-cyan-100">{title}</p>
-      <p className="mt-2 text-sm text-slate-500 leading-relaxed">{description}</p>
     </div>
   );
 }
