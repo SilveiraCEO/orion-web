@@ -845,8 +845,13 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   }
 
   const orbSpeakingLevel =
-    orbMode === "idle" ? 0.04 : Math.max(0.08, Math.min(1, liveLevel * 2.2));
-
+  orbMode === "speaking"
+    ? Math.max(0.18, Math.min(1, liveLevel * 2.8))
+    : orbMode === "listening"
+    ? Math.max(0.14, Math.min(1, liveLevel * 2.2))
+    : orbMode === "processing"
+    ? 0.18
+    : 0.045;
   return (
     <main className="h-screen overflow-hidden bg-[#050816] text-white">
       <div className="pointer-events-none fixed inset-0">
@@ -1000,7 +1005,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
                 <div className="relative flex flex-1 items-center justify-center overflow-hidden">
                   <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_35%,rgba(97,239,255,0.10),transparent_35%),radial-gradient(circle_at_70%_75%,rgba(123,97,255,0.10),transparent_25%)]" />
                   <div className="relative z-10 h-full w-full">
-                    <Orb3D speakingLevel={orbSpeakingLevel} />
+                    <Orb3D mode={orbMode} speakingLevel={orbSpeakingLevel} />
                   </div>
                 </div>
 
