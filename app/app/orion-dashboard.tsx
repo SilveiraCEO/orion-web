@@ -138,6 +138,12 @@ const [memoryStatus, setMemoryStatus] = useState("");
   }, [voiceEnabled]);
 
   useEffect(() => {
+  if (!voiceEnabled) {
+    hardStopAllSpeech();
+  }
+}, [voiceEnabled]);
+
+  useEffect(() => {
     localStorage.setItem("orion_memory_enabled", String(memoryEnabled));
   }, [memoryEnabled]);
 
@@ -837,6 +843,29 @@ const [memoryStatus, setMemoryStatus] = useState("");
     startRecording(false);
   }
 
+  function toggleVoiceEnabled() {
+  const isTurningOff = voiceEnabled;
+
+  if (isTurningOff) {
+    shouldResumeJarvisAfterSpeechRef.current = false;
+    hardStopAllSpeech();
+
+    if (jarvisModeRef.current && !isRecording && !processingVoiceRef.current) {
+      setTimeout(() => {
+        if (
+          jarvisModeRef.current &&
+          !processingVoiceRef.current &&
+          !isSpeakingRef.current
+        ) {
+          startRecording(true);
+        }
+      }, 350);
+    }
+  }
+
+  setVoiceEnabled((current) => !current);
+}
+
   function toggleJarvisMode() {
     if (isJarvisMode) {
       setIsJarvisMode(false);
@@ -1106,11 +1135,11 @@ const [memoryStatus, setMemoryStatus] = useState("");
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <ToggleButton
-                      label="Voz"
-                      active={voiceEnabled}
-                      onClick={() => setVoiceEnabled((value) => !value)}
-                    />
+                   <ToggleButton
+  label="Voz"
+  active={voiceEnabled}
+  onClick={toggleVoiceEnabled}
+/>
                     <ToggleButton
                       label="Memória"
                       active={memoryEnabled}
