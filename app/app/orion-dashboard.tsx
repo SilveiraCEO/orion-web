@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
 
@@ -17,27 +17,42 @@ type AttachedFile = {
   type: string;
 };
 
+type BrainInfo = {
+  provider: string;
+  level: string;
+  model: string;
+  reason?: string;
+};
+
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
+  brain?: BrainInfo;
 };
 
 export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const router = useRouter();
   const supabase = createClient();
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   const [message, setMessage] = useState("");
   const [orbMode, setOrbMode] = useState<OrbMode>("idle");
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const [isSending, setIsSending] = useState(false);
+
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [memoryEnabled, setMemoryEnabled] = useState(true);
+  const [memoryText, setMemoryText] = useState("");
+
   const [chat, setChat] = useState<ChatMessage[]>([
     {
       role: "assistant",
       content:
-        "ORION online. Diga o que precisa otimizar na sua operação, senhor. Prometo não julgar suas métricas... ainda.",
+        "ORION online. Agora sim, com um painel decente. Diga o que deseja otimizar na sua operação.",
     },
   ]);
-  const [isSending, setIsSending] = useState(false);
 
   const quickCommands = [
     "Crie uma copy para anúncio de produto",
@@ -45,8 +60,37 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     "Monte um roteiro UGC de 30 segundos",
     "Crie uma descrição premium para loja",
     "Monte um DRE simples do mês",
-    "Sugira 5 criativos para Meta Ads",
+    "Use o melhor cérebro e faça uma análise máxima da estratégia da minha loja",
   ];
+
+  useEffect(() => {
+    const savedVoice = localStorage.getItem("orion_voice_enabled");
+    const savedMemory = localStorage.getItem("orion_memory_enabled");
+    const savedMemoryText = localStorage.getItem("orion_memory_text");
+
+    if (savedVoice !== null) setVoiceEnabled(savedVoice === "true");
+    if (savedMemory !== null) setMemoryEnabled(savedMemory === "true");
+    if (savedMemoryText) setMemoryText(savedMemoryText);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("orion_voice_enabled", String(voiceEnabled));
+  }, [voiceEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("orion_memory_enabled", String(memoryEnabled));
+  }, [memoryEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("orion_memory_text", memoryText);
+  }, [memoryText]);
+
+  useEffect(() => {
+    chatScrollRef.current?.scrollTo({
+      top: chatScrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
+  }, [chat, isSending]);
 
   const waveformHeights = useMemo(() => {
     if (orbMode === "speaking") {
@@ -69,28 +113,73 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     router.push("/login");
   }
 
+  async function speakWithElevenLabs(text: string) {
+    if (!voiceEnabled) return;
+
+    try {
+      setOrbMode("speaking");
+
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.error || "Falha ao gerar voz.");
+      }
+
+      const blob = await response.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+
+      audio.onended = () => {
+        setOrbMode("idle");
+        URL.revokeObjectURL(audioUrl);
+      };
+
+      audio.onerror = () => {
+        setOrbMode("idle");
+        URL.revokeObjectURL(audioUrl);
+      };
+
+      await audio.play();
+    } catch (error) {
+      console.warn("Falha na voz ElevenLabs:", error);
+      setOrbMode("idle");
+    }
+  }
+
   async function handleSend() {
     const cleanMessage = message.trim();
 
     if ((!cleanMessage && attachedFiles.length === 0) || isSending) return;
 
-    const fileNote =
+    const filesNote =
       attachedFiles.length > 0
         ? "\n\nArquivos anexados pelo usuário: " +
           attachedFiles.map((file) => `${file.name} (${file.type})`).join(", ") +
-          "\nObservação: nesta etapa, os arquivos ainda não são enviados para análise real. Apenas considere os nomes informados."
+          "\nObservação: nesta etapa, os arquivos ainda não são enviados para análise real. Considere apenas os nomes e tipos."
         : "";
 
-    const userContent = cleanMessage || "Analise os arquivos anexados.";
+    const visibleUserContent = cleanMessage || "Analise os arquivos anexados.";
+
+    const memoryNote =
+      memoryEnabled && memoryText.trim()
+        ? `Contexto permanente do usuário:\n${memoryText.trim()}\n\n`
+        : "";
+
+    const messageForAI = memoryNote + visibleUserContent + filesNote;
 
     const userMessage: ChatMessage = {
       role: "user",
-      content: userContent + fileNote,
+      content: visibleUserContent + filesNote,
     };
 
-    const nextChat = [...chat, userMessage];
-
-    setChat(nextChat);
+    setChat((current) => [...current, userMessage]);
     setMessage("");
     setAttachedFiles([]);
     setIsSending(true);
@@ -103,7 +192,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          message: userMessage.content,
+          message: messageForAI,
           history: chat.slice(-8),
         }),
       });
@@ -114,21 +203,19 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
         throw new Error(data.error || "Falha ao conversar com ORION.");
       }
 
-   const assistantText =
-  data.reply || "Resposta vazia. Fascinante, mas inútil.";
+      const assistantText =
+        data.reply || "Resposta vazia. Fascinante, mas inútil.";
 
-const brainLabel = data.brain
-  ? `\n\n[Sistema: ${data.brain.provider} · ${data.brain.level} · ${data.brain.model}]`
-  : "";
-
-const assistantMessage: ChatMessage = {
-  role: "assistant",
-  content: assistantText + brainLabel,
-};
+      const assistantMessage: ChatMessage = {
+        role: "assistant",
+        content: assistantText,
+        brain: data.brain,
+      };
 
       setChat((current) => [...current, assistantMessage]);
-      setOrbMode("speaking");
-      setTimeout(() => setOrbMode("idle"), 1600);
+
+      await speakWithElevenLabs(assistantText);
+      if (!voiceEnabled) setOrbMode("idle");
     } catch (error) {
       setChat((current) => [
         ...current,
@@ -155,11 +242,11 @@ const assistantMessage: ChatMessage = {
       {
         role: "assistant",
         content:
-          "Microfone ainda não está conectado nesta etapa. Próximo módulo: voz real com transcrição e ElevenLabs.",
+          "Microfone ainda não está conectado. Próximo módulo: transcrição real por áudio. A voz de resposta, porém, já pode ser ativada pelo botão de voz.",
       },
     ]);
 
-    setTimeout(() => setOrbMode("idle"), 1800);
+    setTimeout(() => setOrbMode("idle"), 1600);
   }
 
   function handleAttachClick() {
@@ -179,7 +266,6 @@ const assistantMessage: ChatMessage = {
     }));
 
     setAttachedFiles((current) => [...current, ...mapped].slice(0, 8));
-
     event.target.value = "";
   }
 
@@ -192,15 +278,15 @@ const assistantMessage: ChatMessage = {
   }
 
   return (
-    <main className="min-h-screen bg-[#020611] text-white overflow-hidden">
+    <main className="h-screen bg-[#020611] text-white overflow-hidden">
       <div className="fixed inset-0 pointer-events-none">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_35%,rgba(0,212,255,0.14),transparent_32%),radial-gradient(circle_at_85%_80%,rgba(249,115,22,0.08),transparent_22%),radial-gradient(circle_at_15%_90%,rgba(14,165,233,0.08),transparent_22%)]" />
         <div className="absolute inset-0 bg-[linear-gradient(rgba(0,212,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(0,212,255,0.03)_1px,transparent_1px)] bg-[size:42px_42px]" />
         <div className="absolute left-1/2 top-[18%] h-[28rem] w-[28rem] -translate-x-1/2 rounded-full bg-cyan-500/10 blur-3xl" />
       </div>
 
-      <div className="relative z-10 min-h-screen flex flex-col">
-        <header className="h-16 border-b border-cyan-400/15 bg-[#06111d]/80 backdrop-blur-xl flex items-center justify-between px-4 md:px-8">
+      <div className="relative z-10 h-screen flex flex-col overflow-hidden">
+        <header className="h-16 shrink-0 border-b border-cyan-400/15 bg-[#06111d]/80 backdrop-blur-xl flex items-center justify-between px-4 md:px-8">
           <div className="flex items-center gap-4">
             <OrionLogo />
 
@@ -216,7 +302,10 @@ const assistantMessage: ChatMessage = {
 
           <div className="hidden lg:flex items-center gap-3">
             <TopBadge label="IA online" tone="green" />
-            <TopBadge label="Beta founder" tone="cyan" />
+            <TopBadge
+              label={voiceEnabled ? "Voz ativa" : "Voz desligada"}
+              tone={voiceEnabled ? "cyan" : "orange"}
+            />
             <TopBadge
               label={
                 orbMode === "idle"
@@ -227,7 +316,13 @@ const assistantMessage: ChatMessage = {
                   ? "Ouvindo"
                   : "Falando"
               }
-              tone={orbMode === "speaking" ? "orange" : orbMode === "listening" ? "green" : "cyan"}
+              tone={
+                orbMode === "speaking"
+                  ? "orange"
+                  : orbMode === "listening"
+                  ? "green"
+                  : "cyan"
+              }
             />
           </div>
 
@@ -239,48 +334,54 @@ const assistantMessage: ChatMessage = {
           </button>
         </header>
 
-        <section className="flex-1 grid grid-cols-1 xl:grid-cols-[285px_1fr_315px] gap-4 p-4 md:p-6">
-          <aside className="space-y-4 order-2 xl:order-1">
+        <section className="flex-1 min-h-0 grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)_315px] gap-4 p-4 md:p-6 overflow-hidden">
+          <aside className="hidden xl:flex flex-col gap-4 min-h-0 overflow-hidden">
             <Panel title="SISTEMA">
               <StatusRow label="Motor de IA" value="Online" status="ok" />
               <StatusRow label="Supabase" value="Conectado" status="ok" />
               <StatusRow label="Chat" value="Ativo" status="ok" />
-              <StatusRow label="ElevenLabs" value="Próxima etapa" status="warn" />
+              <StatusRow
+                label="ElevenLabs"
+                value={voiceEnabled ? "Ativo" : "Desligado"}
+                status={voiceEnabled ? "ok" : "warn"}
+              />
               <StatusRow label="Arquivos" value="Preparado" status="ok" />
               <StatusRow label="Dropi" value="Aguardando" status="off" />
             </Panel>
 
             <Panel title="USO">
               <div className="space-y-4">
-                <UsageBar label="Mensagens" value={`${chat.length} / 100`} percent={Math.min(chat.length, 100)} />
-                <UsageBar label="Voz" value="0 / 30 min" percent={0} />
-                <UsageBar label="Arquivos" value={`${attachedFiles.length} / 8`} percent={(attachedFiles.length / 8) * 100} />
+                <UsageBar
+                  label="Mensagens"
+                  value={`${chat.length} / 100`}
+                  percent={Math.min(chat.length, 100)}
+                />
+                <UsageBar
+                  label="Arquivos"
+                  value={`${attachedFiles.length} / 8`}
+                  percent={(attachedFiles.length / 8) * 100}
+                />
                 <UsageBar label="Integrações" value="0 / 3" percent={0} />
               </div>
             </Panel>
 
             <Panel title="PERFIL">
-              <div className="rounded-2xl border border-cyan-400/10 bg-white/[0.02] p-4">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-cyan-200/80">
-                  Conta conectada
-                </p>
-                <p className="mt-2 break-all text-sm text-slate-300">{userEmail}</p>
-              </div>
+              <p className="text-[11px] uppercase tracking-[0.22em] text-cyan-200/80">
+                Conta conectada
+              </p>
+              <p className="mt-2 break-all text-sm text-slate-300">{userEmail}</p>
 
-              <div className="mt-3 rounded-2xl border border-cyan-400/10 bg-cyan-400/[0.04] p-4">
+              <div className="mt-4 rounded-2xl border border-cyan-400/10 bg-cyan-400/[0.04] p-4">
                 <p className="text-[11px] uppercase tracking-[0.22em] text-slate-400">
                   Plano atual
                 </p>
                 <p className="mt-1 text-xl font-bold text-white">Beta Founder</p>
-                <p className="mt-2 text-xs text-slate-500">
-                  Acesso inicial ao ecossistema ORION.
-                </p>
               </div>
             </Panel>
           </aside>
 
-          <section className="order-1 xl:order-2 rounded-[28px] border border-cyan-400/15 bg-[#04101b]/75 backdrop-blur-xl shadow-[0_0_80px_rgba(0,212,255,0.08)] overflow-hidden flex flex-col min-h-[720px]">
-            <div className="border-b border-cyan-400/10 px-5 md:px-8 py-4 flex items-center justify-between">
+          <section className="min-h-0 rounded-[28px] border border-cyan-400/15 bg-[#04101b]/75 backdrop-blur-xl shadow-[0_0_80px_rgba(0,212,255,0.08)] overflow-hidden flex flex-col">
+            <div className="shrink-0 border-b border-cyan-400/10 px-5 md:px-8 py-4 flex items-center justify-between">
               <div>
                 <p className="text-[11px] uppercase tracking-[0.28em] text-cyan-300">
                   Núcleo central
@@ -302,11 +403,6 @@ const assistantMessage: ChatMessage = {
                   onClick={() => setOrbMode("processing")}
                 />
                 <ModeButton
-                  label="Listening"
-                  active={orbMode === "listening"}
-                  onClick={() => setOrbMode("listening")}
-                />
-                <ModeButton
                   label="Speaking"
                   active={orbMode === "speaking"}
                   onClick={() => setOrbMode("speaking")}
@@ -314,156 +410,171 @@ const assistantMessage: ChatMessage = {
               </div>
             </div>
 
-            <div className="grid flex-1 grid-cols-1 2xl:grid-cols-[minmax(360px,0.9fr)_minmax(420px,1.1fr)] gap-4 px-5 md:px-8 py-6 overflow-hidden">
-              <div className="flex flex-col items-center justify-center">
+            <div className="flex-1 min-h-0 grid grid-cols-1 2xl:grid-cols-[390px_minmax(0,1fr)] gap-4 px-4 md:px-6 py-4 overflow-hidden">
+              <div className="hidden 2xl:flex flex-col items-center justify-center min-h-0">
                 <OrbCore mode={orbMode} waveformHeights={waveformHeights} />
 
-                <h2 className="mt-6 text-3xl md:text-[2.35rem] font-black tracking-[0.34em] text-cyan-100 text-center uppercase">
+                <h2 className="mt-5 text-3xl font-black tracking-[0.34em] text-cyan-100 text-center uppercase">
                   ORION
                 </h2>
 
-                <p className="mt-3 max-w-xl text-center text-slate-400 text-sm md:text-base">
-                  Crie anúncios, analise margens, organize sua operação e tome decisões
-                  com mais inteligência.
+                <p className="mt-3 max-w-sm text-center text-slate-400 text-sm">
+                  Crie anúncios, analise margens, organize sua operação e tome decisões com mais inteligência.
                 </p>
               </div>
 
-              <div className="min-h-[420px] rounded-3xl border border-cyan-400/10 bg-[#020611]/70 overflow-hidden flex flex-col">
-                <div className="border-b border-cyan-400/10 px-4 py-3">
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-cyan-200">
-                    Conversa neural
-                  </p>
+              <div className="min-h-0 rounded-3xl border border-cyan-400/10 bg-[#020611]/70 overflow-hidden flex flex-col">
+                <div className="shrink-0 border-b border-cyan-400/10 px-4 py-3 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-[0.24em] text-cyan-200">
+                      Conversa neural
+                    </p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Respostas com roteamento automático de modelo.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <ToggleButton
+                      label="Voz"
+                      active={voiceEnabled}
+                      onClick={() => setVoiceEnabled((value) => !value)}
+                    />
+                    <ToggleButton
+                      label="Memória"
+                      active={memoryEnabled}
+                      onClick={() => setMemoryEnabled((value) => !value)}
+                    />
+                  </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                <div
+                  ref={chatScrollRef}
+                  className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3"
+                >
                   {chat.map((item, index) => (
                     <ChatBubble key={index} message={item} />
                   ))}
 
                   {isSending && (
                     <div className="rounded-2xl border border-cyan-400/10 bg-cyan-400/[0.04] p-4 text-sm text-cyan-100">
-                      ORION está analisando...
+                      ORION está analisando. Um raro momento em que pensar antes de falar ajuda.
                     </div>
                   )}
                 </div>
-              </div>
-            </div>
 
-            <div className="border-t border-cyan-400/10 bg-black/20 px-4 md:px-6 py-4">
-              <div className="flex flex-wrap gap-2 mb-4">
-                {quickCommands.map((item) => (
-                  <QuickChip
-                    key={item}
-                    text={item}
-                    onClick={() => applyQuickCommand(item)}
-                  />
-                ))}
-              </div>
-
-              {attachedFiles.length > 0 && (
-                <div className="mb-4 rounded-2xl border border-cyan-400/10 bg-[#020611]/70 p-3">
-                  <p className="mb-3 text-[11px] uppercase tracking-[0.24em] text-cyan-200">
-                    Arquivos anexados
-                  </p>
-
-                  <div className="grid gap-2 md:grid-cols-2">
-                    {attachedFiles.map((file) => (
-                      <AttachedFileCard
-                        key={file.id}
-                        file={file}
-                        onRemove={() => removeFile(file.id)}
+                <div className="shrink-0 border-t border-cyan-400/10 bg-black/20 px-4 py-4">
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    {quickCommands.map((item) => (
+                      <QuickChip
+                        key={item}
+                        text={item}
+                        onClick={() => applyQuickCommand(item)}
                       />
                     ))}
                   </div>
+
+                  {attachedFiles.length > 0 && (
+                    <div className="mb-3 rounded-2xl border border-cyan-400/10 bg-[#020611]/70 p-3">
+                      <p className="mb-3 text-[11px] uppercase tracking-[0.24em] text-cyan-200">
+                        Arquivos anexados
+                      </p>
+
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {attachedFiles.map((file) => (
+                          <AttachedFileCard
+                            key={file.id}
+                            file={file}
+                            onRemove={() => removeFile(file.id)}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    accept="image/*,video/*,audio/*,.gif,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+                    onChange={handleFilesSelected}
+                  />
+
+                  <div className="rounded-2xl border border-cyan-400/15 bg-[#020611]/80 p-2 flex gap-2">
+                    <button
+                      onClick={handleVoiceClick}
+                      className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.06] px-4 py-3 text-sm font-bold text-emerald-200 hover:border-emerald-300/50 hover:bg-emerald-400/[0.1] transition"
+                      title="Microfone em breve"
+                    >
+                      Falar
+                    </button>
+
+                    <button
+                      onClick={handleAttachClick}
+                      className="rounded-xl border border-cyan-400/20 bg-cyan-400/[0.06] px-4 py-3 text-sm font-bold text-cyan-100 hover:border-cyan-300/50 hover:bg-cyan-400/[0.1] transition"
+                    >
+                      Anexar
+                    </button>
+
+                    <input
+                      value={message}
+                      disabled={isSending}
+                      onChange={(e) => setMessage(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleSend();
+                      }}
+                      className="flex-1 min-w-0 bg-transparent px-4 py-3 outline-none text-white placeholder:text-slate-600 disabled:opacity-50"
+                      placeholder="Digite um comando para o ORION..."
+                    />
+
+                    <button
+                      onClick={handleSend}
+                      disabled={isSending}
+                      className="rounded-xl bg-cyan-300 px-5 py-3 text-sm font-bold text-black hover:bg-cyan-200 transition disabled:opacity-50"
+                    >
+                      {isSending ? "..." : "Enviar"}
+                    </button>
+                  </div>
                 </div>
-              )}
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                accept="image/*,video/*,audio/*,.gif,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
-                onChange={handleFilesSelected}
-              />
-
-              <div className="rounded-2xl border border-cyan-400/15 bg-[#020611]/80 p-2 flex gap-2">
-                <button
-                  onClick={handleVoiceClick}
-                  className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.06] px-4 py-3 text-sm font-bold text-emerald-200 hover:border-emerald-300/50 hover:bg-emerald-400/[0.1] transition"
-                  title="Falar com ORION"
-                >
-                  Falar
-                </button>
-
-                <button
-                  onClick={handleAttachClick}
-                  className="rounded-xl border border-cyan-400/20 bg-cyan-400/[0.06] px-4 py-3 text-sm font-bold text-cyan-100 hover:border-cyan-300/50 hover:bg-cyan-400/[0.1] transition"
-                  title="Anexar arquivos"
-                >
-                  Anexar
-                </button>
-
-                <input
-                  value={message}
-                  disabled={isSending}
-                  onChange={(e) => setMessage(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleSend();
-                  }}
-                  className="flex-1 bg-transparent px-4 py-3 outline-none text-white placeholder:text-slate-600 disabled:opacity-50"
-                  placeholder="Digite um comando para o ORION..."
-                />
-
-                <button
-                  onClick={handleSend}
-                  disabled={isSending}
-                  className="rounded-xl bg-cyan-300 px-5 py-3 text-sm font-bold text-black hover:bg-cyan-200 transition disabled:opacity-50"
-                >
-                  {isSending ? "..." : "Enviar"}
-                </button>
               </div>
             </div>
           </section>
 
-          <aside className="space-y-4 order-3">
-            <Panel title="INTEGRAÇÕES">
-              <IntegrationItem
-                title="Dropi"
-                subtitle="Produtos e pedidos"
-                state="Configurar"
+          <aside className="hidden xl:flex flex-col gap-4 min-h-0 overflow-hidden">
+            <Panel title="MEMÓRIA">
+              <p className="text-xs text-slate-500 mb-3">
+                Informações que o ORION deve considerar nas respostas.
+              </p>
+
+              <textarea
+                value={memoryText}
+                onChange={(e) => setMemoryText(e.target.value)}
+                className="h-32 w-full resize-none rounded-2xl border border-cyan-400/10 bg-black/30 p-3 text-sm text-slate-200 outline-none placeholder:text-slate-600 focus:border-cyan-300/40"
+                placeholder="Ex: trabalho com e-commerce, vendo produtos físicos, foco em Meta Ads, quero respostas diretas..."
               />
-              <IntegrationItem
-                title="Nuvemshop"
-                subtitle="Catálogo e loja"
-                state="Em breve"
-              />
-              <IntegrationItem
-                title="Meta Ads"
-                subtitle="Campanhas e criativos"
-                state="Em breve"
-              />
-              <IntegrationItem
-                title="WhatsApp"
-                subtitle="Atendimento e follow-up"
-                state="Em breve"
-              />
+
+              <button
+                onClick={() => setMemoryText("")}
+                className="mt-3 w-full rounded-xl border border-cyan-400/10 bg-cyan-400/[0.04] px-3 py-2 text-sm text-slate-300 hover:text-cyan-100 transition"
+              >
+                Limpar memória local
+              </button>
             </Panel>
 
-            <Panel title="ATALHOS">
-              <ShortcutButton text="Criar copy para anúncio" />
-              <ShortcutButton text="Gerar roteiro UGC" />
-              <ShortcutButton text="Criar oferta premium" />
-              <ShortcutButton text="Montar DRE simples" />
-              <ShortcutButton text="Analisar margem" />
+            <Panel title="INTEGRAÇÕES">
+              <IntegrationItem title="Dropi" subtitle="Produtos e pedidos" state="Configurar" />
+              <IntegrationItem title="Nuvemshop" subtitle="Catálogo e loja" state="Em breve" />
+              <IntegrationItem title="Meta Ads" subtitle="Campanhas e criativos" state="Em breve" />
+              <IntegrationItem title="WhatsApp" subtitle="Atendimento e follow-up" state="Em breve" />
             </Panel>
 
             <Panel title="ROADMAP">
               <RoadmapItem done text="Autenticação web" />
               <RoadmapItem done text="Painel premium" />
-              <RoadmapItem done text="Upload visual de arquivos" />
               <RoadmapItem done text="Chat real com IA" />
-              <RoadmapItem text="Voz ElevenLabs" />
+              <RoadmapItem done text="Roteador de modelos" />
+              <RoadmapItem text="Microfone real" />
               <RoadmapItem text="Ondas sonoras reativas" />
               <RoadmapItem text="Integração Dropi" />
             </Panel>
@@ -480,18 +591,58 @@ function ChatBubble({ message }: { message: ChatMessage }) {
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`max-w-[88%] rounded-2xl border px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
+        className={`max-w-[92%] rounded-2xl border px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${
           isUser
             ? "border-orange-400/20 bg-orange-400/[0.06] text-orange-50"
             : "border-cyan-400/15 bg-cyan-400/[0.05] text-slate-200"
         }`}
       >
-        <p className="mb-1 text-[10px] uppercase tracking-[0.22em] opacity-60">
+        <p className="mb-2 text-[10px] uppercase tracking-[0.22em] opacity-60">
           {isUser ? "Usuário" : "ORION"}
         </p>
-        {message.content}
+
+        <div>{message.content}</div>
+
+        {!isUser && message.brain && (
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-cyan-400/10 pt-3">
+            <SmallBadge text={message.brain.provider} />
+            <SmallBadge text={message.brain.level} />
+            <SmallBadge text={message.brain.model} />
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+function SmallBadge({ text }: { text: string }) {
+  return (
+    <span className="rounded-full border border-cyan-400/15 bg-cyan-400/[0.06] px-2 py-1 text-[10px] uppercase tracking-[0.14em] text-cyan-200">
+      {text}
+    </span>
+  );
+}
+
+function ToggleButton({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full border px-3 py-1.5 text-[11px] transition ${
+        active
+          ? "border-cyan-300/35 bg-cyan-300/10 text-cyan-100"
+          : "border-slate-600/40 bg-white/[0.02] text-slate-500"
+      }`}
+    >
+      {label}: {active ? "on" : "off"}
+    </button>
   );
 }
 
@@ -515,7 +666,7 @@ function OrbCore({
   waveformHeights: number[];
 }) {
   return (
-    <div className="relative flex items-center justify-center h-[21rem] w-[21rem] md:h-[24rem] md:w-[24rem]">
+    <div className="relative flex items-center justify-center h-[20rem] w-[20rem]">
       <div className="absolute inset-0 rounded-full border border-cyan-300/8" />
       <div className="absolute inset-5 rounded-full border border-cyan-300/10" />
       <div className="absolute inset-10 rounded-full border border-cyan-400/18" />
@@ -523,8 +674,6 @@ function OrbCore({
 
       <div className="absolute inset-0 rounded-full bg-[conic-gradient(from_0deg,transparent,rgba(34,211,238,0.22),transparent,rgba(56,189,248,0.14),transparent)] animate-spin [animation-duration:18s]" />
       <div className="absolute inset-8 rounded-full bg-[conic-gradient(from_180deg,transparent,rgba(251,146,60,0.20),transparent,rgba(34,211,238,0.20),transparent)] animate-spin [animation-duration:10s] [animation-direction:reverse]" />
-
-      <div className="absolute h-72 w-72 rounded-full bg-cyan-400/10 blur-3xl" />
 
       {waveformHeights.map((height, index) => {
         const angle = (360 / waveformHeights.length) * index;
@@ -534,7 +683,7 @@ function OrbCore({
             key={index}
             className="absolute left-1/2 top-1/2 origin-center"
             style={{
-              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-150px)`,
+              transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-128px)`,
             }}
           >
             <div
@@ -553,15 +702,13 @@ function OrbCore({
         );
       })}
 
-      <div className="relative flex h-44 w-44 md:h-52 md:w-52 items-center justify-center rounded-full border border-cyan-200/30 bg-[#020611] shadow-[inset_0_0_70px_rgba(34,211,238,0.14),0_0_90px_rgba(34,211,238,0.16)]">
+      <div className="relative flex h-40 w-40 items-center justify-center rounded-full border border-cyan-200/30 bg-[#020611] shadow-[inset_0_0_70px_rgba(34,211,238,0.14),0_0_90px_rgba(34,211,238,0.16)]">
         <div className="absolute inset-4 rounded-full border border-cyan-300/12" />
-        <div className="absolute inset-8 rounded-full bg-cyan-400/10 blur-2xl" />
-        <div className="absolute h-20 w-20 rounded-full bg-cyan-300/12 blur-xl" />
         <div className="absolute h-10 w-10 rounded-full bg-cyan-300 shadow-[0_0_32px_rgba(34,211,238,1)]" />
-        <div className="absolute h-28 w-[2px] bg-gradient-to-b from-transparent via-cyan-300 to-transparent opacity-80" />
-        <div className="absolute h-[2px] w-28 bg-gradient-to-r from-transparent via-orange-300 to-transparent opacity-80" />
+        <div className="absolute h-24 w-[2px] bg-gradient-to-b from-transparent via-cyan-300 to-transparent opacity-80" />
+        <div className="absolute h-[2px] w-24 bg-gradient-to-r from-transparent via-orange-300 to-transparent opacity-80" />
 
-        <div className="absolute top-8 text-[10px] tracking-[0.35em] text-cyan-200/80 uppercase">
+        <div className="absolute top-7 text-[10px] tracking-[0.35em] text-cyan-200/80 uppercase">
           {mode === "listening"
             ? "Ouvindo"
             : mode === "processing"
@@ -569,24 +716,6 @@ function OrbCore({
             : mode === "speaking"
             ? "Falando"
             : "Core"}
-        </div>
-
-        <div className="absolute bottom-6 flex items-end gap-[5px]">
-          {[14, 28, 18, 34, 22, 30, 16].map((h, i) => (
-            <span
-              key={i}
-              className={`w-[4px] rounded-full ${
-                mode === "speaking"
-                  ? i % 3 === 0
-                    ? "bg-orange-300"
-                    : "bg-cyan-200"
-                  : mode === "listening"
-                  ? "bg-emerald-300"
-                  : "bg-cyan-300/80"
-              } animate-pulse`}
-              style={{ height: `${h}px` }}
-            />
-          ))}
         </div>
       </div>
     </div>
@@ -786,21 +915,7 @@ function IntegrationItem({
   );
 }
 
-function ShortcutButton({ text }: { text: string }) {
-  return (
-    <button className="mb-2 w-full rounded-xl border border-cyan-400/10 bg-cyan-400/[0.04] px-3 py-3 text-left text-sm text-slate-300 hover:border-cyan-300/35 hover:text-cyan-100 transition last:mb-0">
-      {text}
-    </button>
-  );
-}
-
-function RoadmapItem({
-  text,
-  done,
-}: {
-  text: string;
-  done?: boolean;
-}) {
+function RoadmapItem({ text, done }: { text: string; done?: boolean }) {
   return (
     <div className="flex items-center gap-3 py-1.5">
       <span
