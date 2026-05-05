@@ -1,6 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ReactNode,
+} from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter } from "next/navigation";
 
@@ -30,6 +37,9 @@ type ChatMessage = {
   brain?: BrainInfo;
 };
 
+const SILENCE_LIMIT_MS = 1400;
+const VOICE_THRESHOLD = 0.045;
+
 export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const router = useRouter();
   const supabase = createClient();
@@ -37,10 +47,23 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const silenceFrameRef = useRef<number | null>(null);
+  const voiceDetectedRef = useRef(false);
+  const lastVoiceAtRef = useRef<number>(0);
+  const jarvisModeRef = useRef(false);
+  const processingVoiceRef = useRef(false);
+
   const [message, setMessage] = useState("");
   const [orbMode, setOrbMode] = useState<OrbMode>("idle");
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isSending, setIsSending] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isJarvisMode, setIsJarvisMode] = useState(false);
 
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const [memoryEnabled, setMemoryEnabled] = useState(true);
@@ -50,7 +73,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     {
       role: "assistant",
       content:
-        "ORION online. Agora sim, com um painel decente. Diga o que deseja otimizar na sua operação.",
+        "ORION online. Modo neural carregado. Agora podemos conversar por texto, por voz manual ou pelo Modo Jarvis.",
     },
   ]);
 
@@ -92,6 +115,17 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     });
   }, [chat, isSending]);
 
+  useEffect(() => {
+    jarvisModeRef.current = isJarvisMode;
+  }, [isJarvisMode]);
+
+  useEffect(() => {
+    return () => {
+      stopListeningLoop();
+      cleanupMic();
+    };
+  }, []);
+
   const waveformHeights = useMemo(() => {
     if (orbMode === "speaking") {
       return [28, 44, 22, 58, 34, 66, 20, 48, 30, 56, 24, 62, 26, 46, 19, 51];
@@ -113,8 +147,16 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     router.push("/login");
   }
 
+  function getMemoryPrompt() {
+    if (!memoryEnabled || !memoryText.trim()) return "";
+    return `Contexto permanente do usuário:\n${memoryText.trim()}\n\n`;
+  }
+
   async function speakWithElevenLabs(text: string) {
-    if (!voiceEnabled) return;
+    if (!voiceEnabled) {
+      setOrbMode("idle");
+      return;
+    }
 
     try {
       setOrbMode("speaking");
@@ -136,27 +178,30 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
       const audioUrl = URL.createObjectURL(blob);
       const audio = new Audio(audioUrl);
 
-      audio.onended = () => {
-        setOrbMode("idle");
-        URL.revokeObjectURL(audioUrl);
-      };
+      await new Promise<void>((resolve) => {
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          resolve();
+        };
 
-      audio.onerror = () => {
-        setOrbMode("idle");
-        URL.revokeObjectURL(audioUrl);
-      };
+        audio.onerror = () => {
+          URL.revokeObjectURL(audioUrl);
+          resolve();
+        };
 
-      await audio.play();
+        audio.play().catch(() => resolve());
+      });
+
+      setOrbMode("idle");
     } catch (error) {
       console.warn("Falha na voz ElevenLabs:", error);
       setOrbMode("idle");
     }
   }
 
-  async function handleSend() {
-    const cleanMessage = message.trim();
-
-    if ((!cleanMessage && attachedFiles.length === 0) || isSending) return;
+  async function sendToOrion(userVisibleText: string, internalText?: string) {
+    const cleanText = userVisibleText.trim();
+    if ((!cleanText && attachedFiles.length === 0) || isSending) return;
 
     const filesNote =
       attachedFiles.length > 0
@@ -165,14 +210,8 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
           "\nObservação: nesta etapa, os arquivos ainda não são enviados para análise real. Considere apenas os nomes e tipos."
         : "";
 
-    const visibleUserContent = cleanMessage || "Analise os arquivos anexados.";
-
-    const memoryNote =
-      memoryEnabled && memoryText.trim()
-        ? `Contexto permanente do usuário:\n${memoryText.trim()}\n\n`
-        : "";
-
-    const messageForAI = memoryNote + visibleUserContent + filesNote;
+    const visibleUserContent = cleanText || "Analise os arquivos anexados.";
+    const messageForAI = getMemoryPrompt() + (internalText || visibleUserContent) + filesNote;
 
     const userMessage: ChatMessage = {
       role: "user",
@@ -213,9 +252,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
       };
 
       setChat((current) => [...current, assistantMessage]);
-
       await speakWithElevenLabs(assistantText);
-      if (!voiceEnabled) setOrbMode("idle");
     } catch (error) {
       setChat((current) => [
         ...current,
@@ -234,26 +271,309 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
     }
   }
 
-  function handleVoiceClick() {
-    setOrbMode("listening");
+  async function handleSend() {
+    await sendToOrion(message);
+  }
+
+  async function createMicSession() {
+    cleanupMic();
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+
+    micStreamRef.current = stream;
+
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+
+    if (AudioContextClass) {
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+
+      analyser.fftSize = 512;
+      source.connect(analyser);
+
+      audioContextRef.current = audioContext;
+      analyserRef.current = analyser;
+    }
+
+    return stream;
+  }
+
+  async function startRecording(autoMode: boolean) {
+    if (isRecording || processingVoiceRef.current) return;
+
+    try {
+      const stream = await createMicSession();
+
+      audioChunksRef.current = [];
+      voiceDetectedRef.current = false;
+      lastVoiceAtRef.current = Date.now();
+
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const chunks = [...audioChunksRef.current];
+        audioChunksRef.current = [];
+        cleanupMic();
+
+        if (chunks.length === 0) {
+          setIsRecording(false);
+          setOrbMode("idle");
+          return;
+        }
+
+        const audioBlob = new Blob(chunks, {
+          type: mediaRecorder.mimeType || "audio/webm",
+        });
+
+        await transcribeAndReply(audioBlob, autoMode);
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+      setOrbMode("listening");
+
+      if (autoMode) {
+        startSilenceDetection();
+      }
+    } catch (error) {
+      setChat((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content:
+            "Não consegui acessar o microfone. Verifique a permissão do navegador e tente novamente.",
+        },
+      ]);
+      console.warn(error);
+      setIsRecording(false);
+      setOrbMode("idle");
+    }
+  }
+
+  function stopCurrentRecording() {
+    stopListeningLoop();
+
+    const recorder = mediaRecorderRef.current;
+
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    } else {
+      cleanupMic();
+      setIsRecording(false);
+      setOrbMode("idle");
+    }
+  }
+
+  async function transcribeAndReply(audioBlob: Blob, autoRestart: boolean) {
+    processingVoiceRef.current = true;
+    setIsRecording(false);
+    setOrbMode("processing");
+
+    try {
+      const formData = new FormData();
+      const audioFile = new File([audioBlob], "orion-voice.webm", {
+        type: audioBlob.type || "audio/webm",
+      });
+
+      formData.append("audio", audioFile);
+
+      const response = await fetch("/api/transcribe", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Falha ao transcrever áudio.");
+      }
+
+      const transcript = String(data.text || "").trim();
+
+      if (!transcript) {
+        setChat((current) => [
+          ...current,
+          {
+            role: "assistant",
+            content: "Não consegui entender o áudio. Um silêncio bastante filosófico.",
+          },
+        ]);
+
+        setOrbMode("idle");
+        return;
+      }
+
+      await sendToOrion(transcript);
+    } catch (error) {
+      setChat((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content:
+            "Falhei ao processar sua voz. " +
+            (error instanceof Error ? error.message : "Erro desconhecido."),
+        },
+      ]);
+      setOrbMode("idle");
+    } finally {
+      processingVoiceRef.current = false;
+
+      if (autoRestart && jarvisModeRef.current) {
+        window.setTimeout(() => {
+          if (jarvisModeRef.current && !processingVoiceRef.current) {
+            startRecording(true);
+          }
+        }, 500);
+      }
+    }
+  }
+
+  function getCurrentAmplitude() {
+    const analyser = analyserRef.current;
+    if (!analyser) return 0;
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteTimeDomainData(dataArray);
+
+    let sum = 0;
+
+    for (let i = 0; i < dataArray.length; i++) {
+      const value = (dataArray[i] - 128) / 128;
+      sum += value * value;
+    }
+
+    return Math.sqrt(sum / dataArray.length);
+  }
+
+  function startSilenceDetection() {
+    stopListeningLoop();
+
+    const tick = () => {
+      if (!jarvisModeRef.current) return;
+
+      const recorder = mediaRecorderRef.current;
+
+      if (!recorder || recorder.state !== "recording") return;
+
+      const amplitude = getCurrentAmplitude();
+      const now = Date.now();
+
+      if (amplitude > VOICE_THRESHOLD) {
+        voiceDetectedRef.current = true;
+        lastVoiceAtRef.current = now;
+      }
+
+      const hasFinishedTalking =
+        voiceDetectedRef.current && now - lastVoiceAtRef.current > SILENCE_LIMIT_MS;
+
+      if (hasFinishedTalking) {
+        stopCurrentRecording();
+        return;
+      }
+
+      silenceFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    silenceFrameRef.current = requestAnimationFrame(tick);
+  }
+
+  function stopListeningLoop() {
+    if (silenceFrameRef.current) {
+      cancelAnimationFrame(silenceFrameRef.current);
+      silenceFrameRef.current = null;
+    }
+  }
+
+  function cleanupMic() {
+    stopListeningLoop();
+
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      audioContextRef.current.close().catch(() => undefined);
+    }
+
+    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+
+    audioContextRef.current = null;
+    analyserRef.current = null;
+    micStreamRef.current = null;
+    mediaRecorderRef.current = null;
+  }
+
+  function handleManualVoiceClick() {
+    if (isJarvisMode) {
+      setChat((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content:
+            "O Modo Jarvis está ativo. Desative-o primeiro para usar a gravação manual.",
+        },
+      ]);
+      return;
+    }
+
+    if (isRecording) {
+      stopCurrentRecording();
+      return;
+    }
+
+    startRecording(false);
+  }
+
+  function toggleJarvisMode() {
+    if (isJarvisMode) {
+      setIsJarvisMode(false);
+      jarvisModeRef.current = false;
+      stopCurrentRecording();
+
+      setChat((current) => [
+        ...current,
+        {
+          role: "assistant",
+          content: "Modo Jarvis desligado. Voltando ao modo civilizado.",
+        },
+      ]);
+
+      return;
+    }
+
+    setIsJarvisMode(true);
+    jarvisModeRef.current = true;
 
     setChat((current) => [
       ...current,
       {
         role: "assistant",
         content:
-          "Microfone ainda não está conectado. Próximo módulo: transcrição real por áudio. A voz de resposta, porém, já pode ser ativada pelo botão de voz.",
+          "Modo Jarvis ativado. Fale normalmente; quando você parar, eu respondo. Uma ideia perigosamente eficiente.",
       },
     ]);
 
-    setTimeout(() => setOrbMode("idle"), 1600);
+    startRecording(true);
   }
 
   function handleAttachClick() {
     fileInputRef.current?.click();
   }
 
-  function handleFilesSelected(event: React.ChangeEvent<HTMLInputElement>) {
+  function handleFilesSelected(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
 
     if (files.length === 0) return;
@@ -307,6 +627,10 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
               tone={voiceEnabled ? "cyan" : "orange"}
             />
             <TopBadge
+              label={isJarvisMode ? "Jarvis on" : "Jarvis off"}
+              tone={isJarvisMode ? "green" : "cyan"}
+            />
+            <TopBadge
               label={
                 orbMode === "idle"
                   ? "Em espera"
@@ -341,9 +665,14 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
               <StatusRow label="Supabase" value="Conectado" status="ok" />
               <StatusRow label="Chat" value="Ativo" status="ok" />
               <StatusRow
-                label="ElevenLabs"
-                value={voiceEnabled ? "Ativo" : "Desligado"}
+                label="Voz"
+                value={voiceEnabled ? "Ativa" : "Desligada"}
                 status={voiceEnabled ? "ok" : "warn"}
+              />
+              <StatusRow
+                label="Modo Jarvis"
+                value={isJarvisMode ? "Ativo" : "Manual"}
+                status={isJarvisMode ? "ok" : "off"}
               />
               <StatusRow label="Arquivos" value="Preparado" status="ok" />
               <StatusRow label="Dropi" value="Aguardando" status="off" />
@@ -419,7 +748,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
                 </h2>
 
                 <p className="mt-3 max-w-sm text-center text-slate-400 text-sm">
-                  Crie anúncios, analise margens, organize sua operação e tome decisões com mais inteligência.
+                  Converse por texto, gravação manual ou Modo Jarvis com detecção de silêncio.
                 </p>
               </div>
 
@@ -430,7 +759,7 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
                       Conversa neural
                     </p>
                     <p className="mt-1 text-xs text-slate-500">
-                      Respostas com roteamento automático de modelo.
+                      Texto, voz manual e conversa automática em Modo Jarvis.
                     </p>
                   </div>
 
@@ -503,11 +832,27 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
 
                   <div className="rounded-2xl border border-cyan-400/15 bg-[#020611]/80 p-2 flex gap-2">
                     <button
-                      onClick={handleVoiceClick}
-                      className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.06] px-4 py-3 text-sm font-bold text-emerald-200 hover:border-emerald-300/50 hover:bg-emerald-400/[0.1] transition"
-                      title="Microfone em breve"
+                      onClick={handleManualVoiceClick}
+                      disabled={isSending || isJarvisMode}
+                      className={`rounded-xl border px-4 py-3 text-sm font-bold transition disabled:opacity-40 ${
+                        isRecording && !isJarvisMode
+                          ? "border-red-400/30 bg-red-400/[0.08] text-red-200"
+                          : "border-emerald-400/20 bg-emerald-400/[0.06] text-emerald-200 hover:border-emerald-300/50 hover:bg-emerald-400/[0.1]"
+                      }`}
                     >
-                      Falar
+                      {isRecording && !isJarvisMode ? "Enviar voz" : "Falar"}
+                    </button>
+
+                    <button
+                      onClick={toggleJarvisMode}
+                      disabled={isSending}
+                      className={`rounded-xl border px-4 py-3 text-sm font-bold transition disabled:opacity-40 ${
+                        isJarvisMode
+                          ? "border-orange-400/30 bg-orange-400/[0.08] text-orange-200"
+                          : "border-cyan-400/20 bg-cyan-400/[0.06] text-cyan-100 hover:border-cyan-300/50 hover:bg-cyan-400/[0.1]"
+                      }`}
+                    >
+                      {isJarvisMode ? "Parar Jarvis" : "Modo Jarvis"}
                     </button>
 
                     <button
@@ -536,6 +881,10 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
                       {isSending ? "..." : "Enviar"}
                     </button>
                   </div>
+
+                  <p className="mt-2 text-xs text-slate-600">
+                    Falar: clique para gravar e clique novamente para enviar. Modo Jarvis: respondo sozinho quando você parar de falar.
+                  </p>
                 </div>
               </div>
             </div>
@@ -574,8 +923,9 @@ export default function OrionDashboard({ userEmail }: OrionDashboardProps) {
               <RoadmapItem done text="Painel premium" />
               <RoadmapItem done text="Chat real com IA" />
               <RoadmapItem done text="Roteador de modelos" />
-              <RoadmapItem text="Microfone real" />
-              <RoadmapItem text="Ondas sonoras reativas" />
+              <RoadmapItem done text="Voz manual" />
+              <RoadmapItem done text="Modo Jarvis beta" />
+              <RoadmapItem text="Ondas sonoras reativas reais" />
               <RoadmapItem text="Integração Dropi" />
             </Panel>
           </aside>
