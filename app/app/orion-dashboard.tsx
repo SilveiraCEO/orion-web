@@ -787,6 +787,46 @@ export default function OrionDashboard({
   return;
 }
 
+const spreadsheetFiles = uploadedFiles.filter((file) => {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+
+  return (
+    type.includes("spreadsheet") ||
+    type.includes("excel") ||
+    type.includes("csv") ||
+    name.endsWith(".xlsx") ||
+    name.endsWith(".xls") ||
+    name.endsWith(".csv")
+  );
+});
+
+let spreadsheetAnalysisText = "";
+
+for (const file of spreadsheetFiles) {
+  if (!file.fileId) continue;
+
+  try {
+    const res = await fetch("/api/read-spreadsheet", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        fileId: file.fileId,
+      }),
+    });
+
+    const data = await res.json();
+
+    if (data.text) {
+      spreadsheetAnalysisText += `\n\nConteúdo estruturado da planilha ${file.name}:\n${data.text}`;
+    }
+  } catch {
+    spreadsheetAnalysisText += `\n\nNão consegui ler a planilha ${file.name}.`;
+  }
+}
+
 if (
   (!cleanText && attachedFiles.length === 0) ||
   isSending ||
@@ -878,7 +918,8 @@ for (const file of uploadedFiles) {
   (internalText || visibleUserContent) +
   filesNote +
   extractedFilesText +
-  imageAnalysisText;
+  imageAnalysisText +
+  spreadsheetAnalysisText;
 
     const userMessage: ChatMessage = {
       role: "user",
