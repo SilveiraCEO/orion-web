@@ -24,6 +24,10 @@ type AttachedFile = {
   name: string;
   size: number;
   type: string;
+  status: "uploading" | "uploaded" | "error";
+  path?: string;
+  fileId?: string;
+  errorMessage?: string;
 };
 
 type BrainInfo = {
@@ -85,6 +89,7 @@ export default function OrionDashboard({
   const [message, setMessage] = useState("");
   const [orbMode, setOrbMode] = useState<OrbMode>("idle");
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isJarvisMode, setIsJarvisMode] = useState(false);
@@ -775,22 +780,45 @@ export default function OrionDashboard({
   async function sendToOrion(userVisibleText: string, internalText?: string) {
     const cleanText = userVisibleText.trim();
 
-    if (
-      (!cleanText && attachedFiles.length === 0) ||
-      isSending ||
-      isChatLoading
-    ) {
-      return;
-    }
+    if (isUploadingFiles) {
+  setChatStatus("Aguarde o upload dos arquivos terminar antes de enviar.");
+  return;
+}
+
+if (
+  (!cleanText && attachedFiles.length === 0) ||
+  isSending ||
+  isChatLoading
+) {
+  return;
+}
 
     const historySnapshot = [...chat];
 
-    const filesNote =
-      attachedFiles.length > 0
-        ? "\n\nArquivos anexados pelo usuário: " +
-          attachedFiles.map((file) => `${file.name} (${file.type})`).join(", ") +
-          "\nObservação: nesta etapa, os arquivos ainda não são enviados para análise real. Considere apenas os nomes e tipos."
-        : "";
+    const uploadedFiles = attachedFiles.filter(
+  (file) => file.status === "uploaded"
+);
+
+const failedFiles = attachedFiles.filter((file) => file.status === "error");
+
+  const filesNote =
+  uploadedFiles.length > 0
+    ? "\n\nArquivos enviados pelo usuário ao Supabase Storage:\n" +
+      uploadedFiles
+        .map(
+          (file) =>
+            `- ${file.name} | tipo: ${file.type} | tamanho: ${formatFileSize(
+              file.size
+            )} | file_id: ${file.fileId} | path: ${file.path}`
+        )
+        .join("\n") +
+      "\nObservação: nesta etapa, os arquivos já foram enviados e registrados, mas a leitura/análise profunda do conteúdo será conectada no próximo módulo."
+    : "";
+
+    if (failedFiles.length > 0 && uploadedFiles.length === 0 && !cleanText) {
+  setChatStatus("Os arquivos anexados falharam no upload. Remova ou tente novamente.");
+  return;
+}
 
     const visibleUserContent = cleanText || "Analise os arquivos anexados.";
     const messageForAI =
@@ -1237,25 +1265,138 @@ export default function OrionDashboard({
     fileInputRef.current?.click();
   }
 
-  function handleFilesSelected(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files || []);
+ function sanitizeFileName(fileName: string) {
+  return fileName
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9.\-_]/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+}
 
-    if (files.length === 0) return;
+function updateAttachedFile(id: string, patch: Partial<AttachedFile>) {
+  setAttachedFiles((current) =>
+    current.map((file) => (file.id === id ? { ...file, ...patch } : file))
+  );
+}
 
-    const mapped = files.map((file) => ({
-      id: crypto.randomUUID(),
-      name: file.name,
-      size: file.size,
-      type: file.type || "arquivo/desconhecido",
-    }));
+async function uploadSingleFile(file: File, sessionId: string) {
+  const tempId = crypto.randomUUID();
+  const safeName = sanitizeFileName(file.name);
+  const path = `${userId}/${sessionId}/${tempId}-${safeName}`;
 
-    setAttachedFiles((current) => [...current, ...mapped].slice(0, 8));
-    event.target.value = "";
+  const optimisticFile: AttachedFile = {
+    id: tempId,
+    name: file.name,
+    size: file.size,
+    type: file.type || "arquivo/desconhecido",
+    status: "uploading",
+  };
+
+  setAttachedFiles((current) => [...current, optimisticFile].slice(0, 8));
+
+  const { error: uploadError } = await supabase.storage
+    .from("orion-files")
+    .upload(path, file, {
+      cacheControl: "3600",
+      upsert: false,
+      contentType: file.type || undefined,
+    });
+
+  if (uploadError) {
+    updateAttachedFile(tempId, {
+      status: "error",
+      errorMessage: uploadError.message,
+    });
+    return;
   }
 
-  function removeFile(id: string) {
-    setAttachedFiles((current) => current.filter((file) => file.id !== id));
+  const { data: metadata, error: metadataError } = await supabase
+    .from("orion_files")
+    .insert({
+      user_id: userId,
+      session_id: sessionId,
+      bucket: "orion-files",
+      path,
+      file_name: file.name,
+      file_type: file.type || "arquivo/desconhecido",
+      file_size: file.size,
+      analysis_status: "uploaded",
+    })
+    .select("id")
+    .single();
+
+  if (metadataError) {
+    await supabase.storage.from("orion-files").remove([path]);
+
+    updateAttachedFile(tempId, {
+      status: "error",
+      errorMessage: metadataError.message,
+    });
+    return;
   }
+
+  updateAttachedFile(tempId, {
+    status: "uploaded",
+    path,
+    fileId: metadata.id,
+  });
+}
+
+async function handleFilesSelected(event: ChangeEvent<HTMLInputElement>) {
+  const input = event.currentTarget;
+  const files = Array.from(input.files || []);
+  input.value = "";
+
+  if (files.length === 0) return;
+
+  const availableSlots = Math.max(0, 8 - attachedFiles.length);
+
+  if (availableSlots === 0) {
+    setChatStatus("Limite de 8 arquivos por mensagem atingido.");
+    return;
+  }
+
+  const selectedFiles = files.slice(0, availableSlots);
+  const sessionId = await ensureActiveSession("Nova conversa");
+
+  if (!sessionId) {
+    setChatStatus("Não consegui criar uma sessão para anexar arquivos.");
+    return;
+  }
+
+  setIsUploadingFiles(true);
+  setChatStatus("Enviando arquivo para o Supabase Storage...");
+
+  await Promise.all(
+    selectedFiles.map((file) => uploadSingleFile(file, sessionId))
+  );
+
+  setIsUploadingFiles(false);
+  setChatStatus("Upload finalizado.");
+
+  setTimeout(() => {
+    setChatStatus("");
+  }, 1800);
+}
+
+async function removeFile(id: string) {
+  const fileToRemove = attachedFiles.find((file) => file.id === id);
+
+  setAttachedFiles((current) => current.filter((file) => file.id !== id));
+
+  if (fileToRemove?.path) {
+    await supabase.storage.from("orion-files").remove([fileToRemove.path]);
+  }
+
+  if (fileToRemove?.fileId) {
+    await supabase
+      .from("orion_files")
+      .delete()
+      .eq("id", fileToRemove.fileId)
+      .eq("user_id", userId);
+  }
+}
 
   function applyQuickCommand(text: string) {
     setMessage(text);
@@ -1576,7 +1717,7 @@ export default function OrionDashboard({
                           <AttachedFileCard
                             key={file.id}
                             file={file}
-                            onRemove={() => removeFile(file.id)}
+                            onRemove={() => void removeFile(file.id)}
                           />
                         ))}
                       </div>
@@ -1588,8 +1729,7 @@ export default function OrionDashboard({
                     type="file"
                     multiple
                     className="hidden"
-                    accept="image/*,video/*,audio/*,.gif,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
-                    onChange={handleFilesSelected}
+accept="image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/mp3,audio/wav,audio/webm,application/pdf,text/plain,text/csv,application/json,.docx,.xlsx,.pptx"                    onChange={handleFilesSelected}
                   />
 
                   <div className="rounded-2xl border border-cyan-300/15 bg-[#050816]/82 p-2 transition-all duration-300 focus-within:border-cyan-300/40 focus-within:shadow-[0_0_30px_rgba(97,239,255,0.1)]">
@@ -1619,11 +1759,12 @@ export default function OrionDashboard({
                       </button>
 
                       <button
-                        onClick={handleAttachClick}
-                        className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.06] px-4 py-3 text-sm font-black text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/50 hover:bg-cyan-300/[0.1]"
-                      >
-                        Anexar
-                      </button>
+  onClick={handleAttachClick}
+  disabled={isUploadingFiles || isSending}
+  className="rounded-xl border border-cyan-300/20 bg-cyan-300/[0.06] px-4 py-3 text-sm font-black text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/50 hover:bg-cyan-300/[0.1] disabled:opacity-50"
+>
+  {isUploadingFiles ? "Subindo..." : "Anexar"}
+</button>
 
                       <input
                         value={message}
@@ -1915,21 +2056,50 @@ function AttachedFileCard({
   file: AttachedFile;
   onRemove: () => void;
 }) {
+  const statusLabel =
+    file.status === "uploading"
+      ? "enviando"
+      : file.status === "uploaded"
+      ? "enviado"
+      : "erro";
+
+  const statusClass =
+    file.status === "uploading"
+      ? "border-orange-400/20 text-orange-300"
+      : file.status === "uploaded"
+      ? "border-emerald-400/20 text-emerald-300"
+      : "border-red-400/20 text-red-300";
+
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-cyan-300/10 bg-cyan-300/[0.04] px-3 py-2">
       <div className="min-w-0">
         <p className="truncate text-sm text-slate-200">{file.name}</p>
+
         <p className="text-xs text-slate-500">
           {formatFileSize(file.size)} · {formatFileType(file.type)}
         </p>
+
+        {file.errorMessage && (
+          <p className="mt-1 line-clamp-1 text-xs text-red-300">
+            {file.errorMessage}
+          </p>
+        )}
       </div>
 
-      <button
-        onClick={onRemove}
-        className="shrink-0 rounded-full border border-red-400/20 px-2 py-1 text-xs text-red-300 transition hover:bg-red-400/10"
-      >
-        remover
-      </button>
+      <div className="flex shrink-0 items-center gap-2">
+        <span
+          className={`rounded-full border px-2 py-1 text-[10px] font-bold uppercase tracking-[0.12em] ${statusClass}`}
+        >
+          {statusLabel}
+        </span>
+
+        <button
+          onClick={onRemove}
+          className="rounded-full border border-red-400/20 px-2 py-1 text-xs text-red-300 transition hover:bg-red-400/10"
+        >
+          remover
+        </button>
+      </div>
     </div>
   );
 }
