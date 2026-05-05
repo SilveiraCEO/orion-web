@@ -39,6 +39,12 @@ type ChatMessage = {
   brain?: BrainInfo;
 };
 
+type ChatSession = {
+  id: string;
+  title: string;
+  updated_at: string;
+};
+
 const WELCOME_MESSAGE: ChatMessage = {
   role: "assistant",
   content:
@@ -83,19 +89,22 @@ export default function OrionDashboard({
   const [isRecording, setIsRecording] = useState(false);
   const [isJarvisMode, setIsJarvisMode] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
+
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [memoryText, setMemoryText] = useState("");
   const [isMemoryLoading, setIsMemoryLoading] = useState(true);
   const [isMemorySaving, setIsMemorySaving] = useState(false);
   const [memoryStatus, setMemoryStatus] = useState("");
+
   const [liveLevel, setLiveLevel] = useState(0);
 
+  const [chat, setChat] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [isChatLoading, setIsChatLoading] = useState(true);
+  const [isSessionsLoading, setIsSessionsLoading] = useState(true);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [chatStatus, setChatStatus] = useState("");
-
-  const [chat, setChat] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
 
   const quickCommands = [
     "Crie uma copy premium para anúncio",
@@ -105,6 +114,12 @@ export default function OrionDashboard({
     "Monte um DRE simples do mês",
     "Use o melhor cérebro e faça uma análise máxima da minha loja",
   ];
+
+  const activeSession = chatSessions.find(
+    (session) => session.id === activeSessionId
+  );
+
+  const activeSessionTitle = activeSession?.title || "Nova conversa";
 
   const waveformHeights = useMemo(() => {
     const level = Math.min(1, Math.max(0, liveLevel));
@@ -207,27 +222,16 @@ export default function OrionDashboard({
   useEffect(() => {
     let mounted = true;
 
-    async function loadLatestChat() {
+    async function bootChat() {
       setIsChatLoading(true);
+      setIsSessionsLoading(true);
       setChatStatus("");
 
-      const { data: sessions, error: sessionError } = await supabase
-        .from("chat_sessions")
-        .select("id, title, updated_at")
-        .eq("user_id", userId)
-        .order("updated_at", { ascending: false })
-        .limit(1);
+      const sessions = await loadChatSessions();
 
       if (!mounted) return;
 
-      if (sessionError) {
-        setChatStatus("Não consegui carregar suas conversas.");
-        setChat([WELCOME_MESSAGE]);
-        setIsChatLoading(false);
-        return;
-      }
-
-      const latestSession = sessions?.[0];
+      const latestSession = sessions[0];
 
       if (!latestSession) {
         const sessionId = await createChatSession("Nova conversa");
@@ -237,48 +241,20 @@ export default function OrionDashboard({
         setActiveSessionId(sessionId);
         setChat([WELCOME_MESSAGE]);
         setIsChatLoading(false);
+        setIsSessionsLoading(false);
         return;
       }
 
       setActiveSessionId(latestSession.id);
-
-      const { data: messages, error: messagesError } = await supabase
-        .from("chat_messages")
-        .select("role, content, brain_provider, brain_level, brain_model")
-        .eq("session_id", latestSession.id)
-        .eq("user_id", userId)
-        .order("created_at", { ascending: true });
+      await loadChatMessages(latestSession.id);
 
       if (!mounted) return;
 
-      if (messagesError) {
-        setChatStatus(
-          "Conversa encontrada, mas não consegui carregar as mensagens."
-        );
-        setChat([WELCOME_MESSAGE]);
-        setIsChatLoading(false);
-        return;
-      }
-
-      const mappedMessages: ChatMessage[] =
-        messages?.map((item) => ({
-          role: item.role === "user" ? "user" : "assistant",
-          content: item.content,
-          brain:
-            item.role === "assistant" && item.brain_model
-              ? {
-                  provider: item.brain_provider ?? "IA",
-                  level: item.brain_level ?? "default",
-                  model: item.brain_model ?? "modelo",
-                }
-              : undefined,
-        })) ?? [];
-
-      setChat(mappedMessages.length > 0 ? mappedMessages : [WELCOME_MESSAGE]);
       setIsChatLoading(false);
+      setIsSessionsLoading(false);
     }
 
-    void loadLatestChat();
+    void bootChat();
 
     return () => {
       mounted = false;
@@ -299,14 +275,78 @@ export default function OrionDashboard({
     return clean.length > 48 ? clean.slice(0, 48) + "..." : clean;
   }
 
+  async function loadChatSessions() {
+    setIsSessionsLoading(true);
+
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .select("id, title, updated_at")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false })
+      .limit(30);
+
+    if (error) {
+      setChatStatus("Não consegui carregar suas conversas.");
+      setIsSessionsLoading(false);
+      return [];
+    }
+
+    const sessions = (data ?? []) as ChatSession[];
+
+    setChatSessions(sessions);
+    setIsSessionsLoading(false);
+
+    return sessions;
+  }
+
+  async function loadChatMessages(sessionId: string) {
+    setIsChatLoading(true);
+    setChatStatus("");
+
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .select("role, content, brain_provider, brain_level, brain_model")
+      .eq("session_id", sessionId)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setChatStatus(
+        "Conversa encontrada, mas não consegui carregar as mensagens."
+      );
+      setChat([WELCOME_MESSAGE]);
+      setIsChatLoading(false);
+      return;
+    }
+
+    const mappedMessages: ChatMessage[] =
+      data?.map((item) => ({
+        role: item.role === "user" ? "user" : "assistant",
+        content: item.content,
+        brain:
+          item.role === "assistant" && item.brain_model
+            ? {
+                provider: item.brain_provider ?? "IA",
+                level: item.brain_level ?? "default",
+                model: item.brain_model ?? "modelo",
+              }
+            : undefined,
+      })) ?? [];
+
+    setChat(mappedMessages.length > 0 ? mappedMessages : [WELCOME_MESSAGE]);
+    setIsChatLoading(false);
+  }
+
   async function createChatSession(firstMessage?: string) {
+    const title = makeSessionTitle(firstMessage || "Nova conversa");
+
     const { data, error } = await supabase
       .from("chat_sessions")
       .insert({
         user_id: userId,
-        title: makeSessionTitle(firstMessage || "Nova conversa"),
+        title,
       })
-      .select("id")
+      .select("id, title, updated_at")
       .single();
 
     if (error) {
@@ -314,8 +354,15 @@ export default function OrionDashboard({
       return null;
     }
 
-    setActiveSessionId(data.id);
-    return data.id as string;
+    const newSession = data as ChatSession;
+
+    setActiveSessionId(newSession.id);
+    setChatSessions((current) => [
+      newSession,
+      ...current.filter((session) => session.id !== newSession.id),
+    ]);
+
+    return newSession.id;
   }
 
   async function ensureActiveSession(firstMessage?: string) {
@@ -324,11 +371,13 @@ export default function OrionDashboard({
   }
 
   async function touchChatSession(sessionId: string, firstMessage?: string) {
+    const updatedAt = new Date().toISOString();
+
     const payload: {
       updated_at: string;
       title?: string;
     } = {
-      updated_at: new Date().toISOString(),
+      updated_at: updatedAt,
     };
 
     if (firstMessage) {
@@ -340,6 +389,23 @@ export default function OrionDashboard({
       .update(payload)
       .eq("id", sessionId)
       .eq("user_id", userId);
+
+    setChatSessions((current) => {
+      const updated = current.map((session) =>
+        session.id === sessionId
+          ? {
+              ...session,
+              title: payload.title ?? session.title,
+              updated_at: updatedAt,
+            }
+          : session
+      );
+
+      return updated.sort(
+        (a, b) =>
+          new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+      );
+    });
   }
 
   async function saveChatMessageToSupabase(
@@ -362,6 +428,8 @@ export default function OrionDashboard({
   }
 
   async function createNewConversation() {
+    if (isSending) return;
+
     setIsCreatingSession(true);
     setChatStatus("");
     hardStopAllSpeech();
@@ -380,6 +448,60 @@ export default function OrionDashboard({
     setTimeout(() => {
       setChatStatus("");
     }, 1800);
+  }
+
+  async function openChatSession(sessionId: string) {
+    if (isSending || sessionId === activeSessionId) return;
+
+    hardStopAllSpeech();
+    setActiveSessionId(sessionId);
+    setMessage("");
+    setAttachedFiles([]);
+    await loadChatMessages(sessionId);
+  }
+
+  async function deleteChatSession(sessionId: string) {
+    if (isSending) return;
+
+    const shouldDelete = window.confirm(
+      "Excluir esta conversa? Essa ação não pode ser desfeita."
+    );
+
+    if (!shouldDelete) return;
+
+    hardStopAllSpeech();
+
+    const { error } = await supabase
+      .from("chat_sessions")
+      .delete()
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+
+    if (error) {
+      setChatStatus("Não consegui excluir esta conversa.");
+      return;
+    }
+
+    const remainingSessions = chatSessions.filter(
+      (session) => session.id !== sessionId
+    );
+
+    setChatSessions(remainingSessions);
+
+    if (sessionId !== activeSessionId) return;
+
+    const nextSession = remainingSessions[0];
+
+    if (nextSession) {
+      setActiveSessionId(nextSession.id);
+      await loadChatMessages(nextSession.id);
+      return;
+    }
+
+    const newSessionId = await createChatSession("Nova conversa");
+
+    setActiveSessionId(newSessionId);
+    setChat([WELCOME_MESSAGE]);
   }
 
   function getMemoryPrompt() {
@@ -653,7 +775,11 @@ export default function OrionDashboard({
   async function sendToOrion(userVisibleText: string, internalText?: string) {
     const cleanText = userVisibleText.trim();
 
-    if ((!cleanText && attachedFiles.length === 0) || isSending || isChatLoading) {
+    if (
+      (!cleanText && attachedFiles.length === 0) ||
+      isSending ||
+      isChatLoading
+    ) {
       return;
     }
 
@@ -1204,8 +1330,42 @@ export default function OrionDashboard({
           </button>
         </header>
 
-        <section className="grid flex-1 min-h-0 grid-cols-1 gap-4 overflow-hidden p-4 md:p-6 xl:grid-cols-[280px_minmax(0,1fr)_315px]">
-          <aside className="hidden min-h-0 flex-col gap-4 overflow-hidden xl:flex">
+        <section className="grid flex-1 min-h-0 grid-cols-1 gap-4 overflow-hidden p-4 md:p-6 xl:grid-cols-[300px_minmax(0,1fr)_315px]">
+          <aside className="orion-scroll hidden min-h-0 flex-col gap-4 overflow-y-auto pr-1 xl:flex">
+            <Panel title="CONVERSAS">
+              <button
+                onClick={() => void createNewConversation()}
+                disabled={isCreatingSession || isSending}
+                className="mb-3 w-full rounded-2xl border border-cyan-300/20 bg-cyan-300/[0.08] px-4 py-3 text-sm font-black text-cyan-100 transition-all duration-300 hover:-translate-y-0.5 hover:border-cyan-300/40 hover:bg-cyan-300/[0.12] disabled:opacity-50"
+              >
+                {isCreatingSession ? "Criando..." : "+ Nova conversa"}
+              </button>
+
+              {isSessionsLoading && (
+                <div className="rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-3 text-xs text-cyan-100">
+                  Carregando conversas...
+                </div>
+              )}
+
+              {!isSessionsLoading && chatSessions.length === 0 && (
+                <div className="rounded-2xl border border-cyan-300/10 bg-cyan-300/[0.04] p-3 text-xs text-slate-400">
+                  Nenhuma conversa salva ainda.
+                </div>
+              )}
+
+              <div className="space-y-2">
+                {chatSessions.map((session) => (
+                  <SessionItem
+                    key={session.id}
+                    session={session}
+                    active={session.id === activeSessionId}
+                    onOpen={() => void openChatSession(session.id)}
+                    onDelete={() => void deleteChatSession(session.id)}
+                  />
+                ))}
+              </div>
+            </Panel>
+
             <Panel title="SISTEMA">
               <StatusRow label="Motor de IA" value="Online" status="ok" />
               <StatusRow label="Supabase" value="Conectado" status="ok" />
@@ -1229,6 +1389,11 @@ export default function OrionDashboard({
                   label="Mensagens"
                   value={`${chat.length} / 100`}
                   percent={Math.min(chat.length, 100)}
+                />
+                <UsageBar
+                  label="Conversas"
+                  value={`${chatSessions.length} / 30`}
+                  percent={(chatSessions.length / 30) * 100}
                 />
                 <UsageBar
                   label="Arquivos"
@@ -1268,8 +1433,8 @@ export default function OrionDashboard({
                 <p className="text-[11px] uppercase tracking-[0.3em] text-cyan-300">
                   Neural Command Center
                 </p>
-                <h2 className="mt-1 text-xl font-bold text-white">
-                  Painel principal do ORION
+                <h2 className="mt-1 line-clamp-1 text-xl font-bold text-white">
+                  {activeSessionTitle}
                 </h2>
               </div>
 
@@ -1319,8 +1484,8 @@ export default function OrionDashboard({
                   </div>
 
                   <p className="mt-4 text-center text-xs leading-relaxed text-slate-500">
-                    O geoide reage ao nível de voz e ficará ainda mais vivo
-                    quando conectarmos o modo speaking/listening definitivo.
+                    O geoide reage ao estado da conversa, voz captada e fala da
+                    IA em tempo real.
                   </p>
                 </div>
               </div>
@@ -1332,7 +1497,8 @@ export default function OrionDashboard({
                       Conversa neural
                     </p>
                     <p className="mt-1 text-xs text-slate-500">
-                      Texto, voz manual e conversa automática em Modo Jarvis.
+                      Histórico salvo, voz manual e conversa automática em Modo
+                      Jarvis.
                     </p>
                   </div>
 
@@ -1493,7 +1659,7 @@ export default function OrionDashboard({
             </div>
           </section>
 
-          <aside className="hidden min-h-0 flex-col gap-4 overflow-hidden xl:flex">
+          <aside className="orion-scroll hidden min-h-0 flex-col gap-4 overflow-y-auto pr-1 xl:flex">
             <Panel title="MEMÓRIA">
               <p className="mb-3 text-xs text-slate-500">
                 Informações que o ORION deve considerar nas respostas. Agora isso
@@ -1572,7 +1738,8 @@ export default function OrionDashboard({
               <RoadmapItem done text="Geoide 3D" />
               <RoadmapItem done text="Memória persistente" />
               <RoadmapItem done text="Histórico de conversas" />
-              <RoadmapItem text="Lista lateral de chats" />
+              <RoadmapItem done text="Lista lateral de chats" />
+              <RoadmapItem text="Upload real de arquivos" />
             </Panel>
           </aside>
         </section>
@@ -1615,6 +1782,57 @@ export default function OrionDashboard({
       `}</style>
     </main>
   );
+}
+
+function SessionItem({
+  session,
+  active,
+  onOpen,
+  onDelete,
+}: {
+  session: ChatSession;
+  active: boolean;
+  onOpen: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div
+      className={`group rounded-2xl border p-3 transition-all duration-300 ${
+        active
+          ? "border-cyan-300/35 bg-cyan-300/[0.08] shadow-[0_0_22px_rgba(97,239,255,0.08)]"
+          : "border-cyan-300/10 bg-white/[0.02] hover:border-cyan-300/25 hover:bg-cyan-300/[0.04]"
+      }`}
+    >
+      <button onClick={onOpen} className="w-full text-left">
+        <p className="line-clamp-2 text-sm font-semibold text-slate-100">
+          {session.title || "Nova conversa"}
+        </p>
+        <p className="mt-2 text-[11px] text-slate-500">
+          {formatSessionDate(session.updated_at)}
+        </p>
+      </button>
+
+      <button
+        onClick={onDelete}
+        className="mt-3 rounded-full border border-red-400/15 px-2 py-1 text-[10px] font-bold text-red-300 opacity-60 transition hover:bg-red-400/10 hover:opacity-100"
+      >
+        Excluir
+      </button>
+    </div>
+  );
+}
+
+function formatSessionDate(date: string) {
+  const parsed = new Date(date);
+
+  if (Number.isNaN(parsed.getTime())) return "Sem data";
+
+  return parsed.toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function ChatBubble({ message }: { message: ChatMessage }) {
